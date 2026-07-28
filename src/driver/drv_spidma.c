@@ -433,18 +433,34 @@ _exit:
 }
 
 
+/* Max wait for DMA/SPI TX complete IRQ.
+ * Stock used BEKEN_NEVER_TIMEOUT — on BK7238 the finish IRQ sometimes never
+ * arrives, hanging SM16703P_Start / HTTP forever. Frame may still hit the wire.
+ * Lumary L-SD8E / dual white+ring testing: 100 ms is enough for 62 RGB LEDs.
+ */
+#ifndef OBK_SPIDMA_TX_TIMEOUT_MS
+#define OBK_SPIDMA_TX_TIMEOUT_MS  100
+#endif
+
 int spidma_spi_master_dma_send(struct spi_message *spi_msg) {
 	int ret = 0;
+	OSStatus sem_ret;
 
 	GLOBAL_INT_DECLARATION();
 	ASSERT(spi_msg != NULL);
-	if (spi_dev->init_dma_tx == 0 || spi_dev == NULL) {
+	if (spi_dev == NULL || spi_dev->init_dma_tx == 0) {
 		ADDLOG_ERROR(LOG_FEATURE_CMD, "spi_dma_send_ no init!");
 		return -1;
 	}
+	/* Previous transfer left flag set (timeout without IRQ) — recover. */
 	if (spi_dev->flag & TX_FINISH_FLAG) {
-		ADDLOG_ERROR(LOG_FEATURE_CMD, "spi_dma_send_ TX_FINISH_FLAG!");
-		return -2;
+		ADDLOG_ERROR(LOG_FEATURE_CMD, "spi_dma_send_ clearing stuck TX_FINISH_FLAG");
+		spidma_dma_tx_enable(0);
+		GLOBAL_INT_DISABLE();
+		spi_dev->flag &= ~(TX_FINISH_FLAG);
+		GLOBAL_INT_RESTORE();
+		/* drain semaphore if callback ran late */
+		rtos_get_semaphore(&spi_dev->dma_tx_sem, 0);
 	}
 
 	if (spi_dev->tx_ptr != spi_msg->send_buf) {
@@ -475,15 +491,22 @@ int spidma_spi_master_dma_send(struct spi_message *spi_msg) {
 
 	spidma_dma_tx_enable(1);
 	ADDLOG_EXTRADEBUG(LOG_FEATURE_CMD, "enable tx 0x%08x", REG_READ(SPI_CONFIG));
-	/* wait tx finish */
-	//if (user_dma_tx_finish_callback == NULL) {
+	/* wait tx finish — finite timeout (BK7238 / SM16703P multi-Start) */
 	//因为写DMA是主动操作，所以DMA传输完成后，SPI不一定发送完成了。
 
-	rtos_get_semaphore(&spi_dev->dma_tx_sem, BEKEN_NEVER_TIMEOUT);
+	sem_ret = rtos_get_semaphore(&spi_dev->dma_tx_sem, OBK_SPIDMA_TX_TIMEOUT_MS);
+	if (sem_ret != kNoErr) {
+		/* IRQ missed or late — abort wait so HTTP/cmd path stays responsive.
+		 * LEDs may already show the new frame (observed on Lumary BK7238). */
+		ADDLOG_ERROR(LOG_FEATURE_CMD, "spi_dma_send_ timeout %d ms (sem=%d)",
+			OBK_SPIDMA_TX_TIMEOUT_MS, (int)sem_ret);
+		spidma_dma_tx_enable(0);
+		GLOBAL_INT_DISABLE();
+		spi_dev->flag &= ~(TX_FINISH_FLAG);
+		GLOBAL_INT_RESTORE();
+		return -4;
+	}
 	ret = spi_dev->flag;
-	//ADDLOG_ERROR(LOG_FEATURE_CMD, "rtos_semaphore ret 0x%08x", ret);
-	//} else
-	//ret = 0;
 
 	if (spi_msg->send_buf != NULL)
 		return ret;
@@ -526,7 +549,8 @@ void SPIDMA_StopTX() {
 
 void SPIDMA_Deinit(void)
 {
-
+	/* Was empty — left SPI/DMA/sem in a bad state for the next startDriver. */
+	spidma_spi_master_deinit();
 }
 
 #elif PLATFORM_ESPIDF
