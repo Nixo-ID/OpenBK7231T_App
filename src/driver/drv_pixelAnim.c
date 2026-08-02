@@ -245,16 +245,305 @@ void TheaterChaseRainbow_Run() {
 // startDriver PixelAnim
 
 int activeAnim = -1;
+int g_speed = 0;
+void PixelAnim_SetAnim(int j);
+
+/* ---- Cloudcutter Beacon (on-device, HA button only) ----
+ * Spec: notes/ANIMATION_DESIGN.md
+ * Beacon <anim> <bright> <click> <repeats>
+ *  anim: mode (v1: 1 = dual-sector beacon)
+ *  bright: 0-255 scale of base RGB
+ *  click: 1=none 2=single 3=double/triple on main whites ch1/2
+ *  repeats: full revolutions then self-stop + restore
+ */
+#ifndef BEACON_SECTOR_W
+#define BEACON_SECTOR_W		12
+#endif
+#ifndef BEACON_TAIL
+#define BEACON_TAIL			12
+#endif
+/* ~2 LED/tick equivalent with sub-pixel; tick = 25 ms */
+#ifndef BEACON_SPEED_LED
+#define BEACON_SPEED_LED	2.0f
+#endif
+#ifndef BEACON_CLICK_TICKS_DEF
+#define BEACON_CLICK_TICKS_DEF	2
+#endif
+#define BEACON_CH_WW		1
+#define BEACON_CH_CW		2
+#define BEACON_CH_R		10
+#define BEACON_CH_G		11
+#define BEACON_CH_B		12
+#define BEACON_SET_FLAGS	(CHANNEL_SET_FLAG_FORCE | CHANNEL_SET_FLAG_SILENT | CHANNEL_SET_FLAG_SKIP_MQTT)
+
+typedef struct beaconState_s {
+	int active;
+	int bright;		/* 0-255 */
+	int clickMode;		/* 1 none, 2 single, 3 double */
+	int clickTicks;		/* duration of each on/off phase */
+	int repeats;
+	int revDone;
+	float pos;		/* sub-pixel head position */
+	float speed;		/* LED per tick */
+	byte colR, colG, colB;
+	int saveWW, saveCW;
+	int saveR, saveG, saveB;
+	int clickPhase;		/* 0 idle, >0 remaining ticks in current sub-phase */
+	int clickStep;		/* which part of multi-click sequence */
+	int seamLatched;	/* one click train per seam crossing per rev */
+	float prevPos;
+} beaconState_t;
+
+static beaconState_t g_beacon;
+static int g_beaconAnimIndex = -1;
+
+static int Beacon_ModLED(int idx, int n) {
+	if (n <= 0) return 0;
+	idx %= n;
+	if (idx < 0) idx += n;
+	return idx;
+}
+
+static byte Beacon_Scale(byte c, int bright, float scale) {
+	float v = (float)c * (float)bright * (1.0f / 255.0f) * scale;
+	if (v < 0) v = 0;
+	if (v > 255) v = 255;
+	return (byte)(v + 0.5f);
+}
+
+static void Beacon_AddPixel(int idx, int n, byte r, byte g, byte b, float scale, int bright) {
+	byte er, eg, eb;
+	if (scale <= 0.001f) return;
+	idx = Beacon_ModLED(idx, n);
+	er = Beacon_Scale(r, bright, scale);
+	eg = Beacon_Scale(g, bright, scale);
+	eb = Beacon_Scale(b, bright, scale);
+	/* frame is cleared each tick; opposite sectors rarely share a pixel */
+	Strip_setPixel(idx, er, eg, eb, 0, 0);
+}
+
+/* Sub-pixel head + decaying tail (one sector). */
+static void Beacon_DrawSector(float headPos, int n, byte r, byte g, byte b, int bright) {
+	int base = (int)floorf(headPos);
+	float frac = headPos - (float)base;
+	int t;
+
+	/* head split across two LEDs */
+	Beacon_AddPixel(base, n, r, g, b, 1.0f - frac, bright);
+	Beacon_AddPixel(base + 1, n, r, g, b, frac, bright);
+
+	for (t = 1; t <= BEACON_TAIL; t++) {
+		float scale = (float)(BEACON_TAIL - t) / (float)BEACON_TAIL;
+		if (scale < 0) scale = 0;
+		/* tail behind head (CW motion = increasing index → tail at lower index) */
+		Beacon_AddPixel(base - t, n, r, g, b, scale * (1.0f - frac), bright);
+		Beacon_AddPixel(base - t + 1, n, r, g, b, scale * frac, bright);
+	}
+}
+
+static void Beacon_WhitesHard(int ww, int cw) {
+	CHANNEL_Set(BEACON_CH_WW, ww, BEACON_SET_FLAGS);
+	CHANNEL_Set(BEACON_CH_CW, cw, BEACON_SET_FLAGS);
+}
+
+static void Beacon_Restore(void) {
+	int n = (int)pixel_count;
+	int i;
+
+	g_beacon.active = 0;
+	/* leave Light_Anim so stock tick stops calling us */
+	g_lightMode = Light_RGB;
+
+	if (n > 0) {
+		for (i = 0; i < n; i++) {
+			Strip_setPixel(i, g_beacon.saveR, g_beacon.saveG, g_beacon.saveB, 0, 0);
+		}
+		Strip_Apply();
+	}
+
+	CHANNEL_Set(BEACON_CH_R, g_beacon.saveR, BEACON_SET_FLAGS);
+	CHANNEL_Set(BEACON_CH_G, g_beacon.saveG, BEACON_SET_FLAGS);
+	CHANNEL_Set(BEACON_CH_B, g_beacon.saveB, BEACON_SET_FLAGS);
+	Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
+
+	ADDLOG_INFO(LOG_FEATURE_CMD, "Beacon: restore WW=%i CW=%i RGB=%i,%i,%i",
+		g_beacon.saveWW, g_beacon.saveCW, g_beacon.saveR, g_beacon.saveG, g_beacon.saveB);
+}
+
+static void Beacon_StartClickTrain(void) {
+	if (g_beacon.clickMode <= 1) return;
+	g_beacon.clickStep = 0;
+	g_beacon.clickPhase = g_beacon.clickTicks;
+	/* step 0 = first ON */
+	Beacon_WhitesHard(100, 100);
+}
+
+static void Beacon_ClickTick(void) {
+	int pulses;
+
+	if (g_beacon.clickMode <= 1) return;
+	if (g_beacon.clickPhase <= 0 && g_beacon.clickStep < 0) return;
+	if (g_beacon.clickPhase <= 0) return;
+
+	g_beacon.clickPhase--;
+	if (g_beacon.clickPhase > 0) return;
+
+	/* end of current sub-phase */
+	pulses = (g_beacon.clickMode == 2) ? 1 : 3; /* 2=single, 3=triple-ish */
+	/* sequence: ON, OFF, ON, OFF, ... for `pulses` ONs */
+	g_beacon.clickStep++;
+	if (g_beacon.clickStep >= pulses * 2 - 1) {
+		/* done — restore whites */
+		Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
+		g_beacon.clickStep = -1;
+		g_beacon.clickPhase = 0;
+		return;
+	}
+	if ((g_beacon.clickStep & 1) == 0) {
+		/* even: ON */
+		Beacon_WhitesHard(100, 100);
+	} else {
+		Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
+	}
+	g_beacon.clickPhase = g_beacon.clickTicks;
+}
+
+void Beacon_Run(void) {
+	int n;
+	float half;
+	float crossed;
+
+	if (!g_beacon.active) {
+		return;
+	}
+	n = (int)pixel_count;
+	if (n <= 0) {
+		Beacon_Restore();
+		activeAnim = -1;
+		return;
+	}
+
+	half = (float)n * 0.5f;
+
+	/* clear frame then draw two opposite sectors */
+	Strip_setAllPixels(0, 0, 0, 0, 0);
+	Beacon_DrawSector(g_beacon.pos, n, g_beacon.colR, g_beacon.colG, g_beacon.colB, g_beacon.bright);
+	Beacon_DrawSector(g_beacon.pos + half, n, g_beacon.colR, g_beacon.colG, g_beacon.colB, g_beacon.bright);
+	Strip_Apply();
+
+	/* seam click: head crossing index 0 (mod n) */
+	if (g_beacon.clickMode > 1) {
+		float p0 = g_beacon.prevPos;
+		float p1 = g_beacon.pos;
+		/* unwrap */
+		while (p1 < p0) p1 += (float)n;
+		/* crossed integer multiple of n (seam) */
+		crossed = floorf(p0 / (float)n) != floorf(p1 / (float)n);
+		if (crossed && !g_beacon.seamLatched) {
+			Beacon_StartClickTrain();
+			g_beacon.seamLatched = 1;
+		}
+		/* clear latch once well past seam */
+		if (fmodf(g_beacon.pos, (float)n) > 2.0f) {
+			g_beacon.seamLatched = 0;
+		}
+	}
+	Beacon_ClickTick();
+
+	g_beacon.prevPos = g_beacon.pos;
+	g_beacon.pos += g_beacon.speed;
+	if (g_beacon.pos >= (float)n) {
+		g_beacon.pos -= (float)n;
+		g_beacon.revDone++;
+		if (g_beacon.revDone >= g_beacon.repeats) {
+			Beacon_Restore();
+			activeAnim = -1;
+			MQTT_PublishMain_StringString_DeDuped(DEDUP_CURRENT_ANIM, DEDUP_EXPIRE_TIME, "currentAnim", "None", 0);
+			return;
+		}
+	}
+}
+
+void Beacon_Begin(int anim, int bright, int clickMode, int repeats) {
+	(void)anim; /* v1: single beacon mode */
+
+	if (pixel_count == 0) {
+		ADDLOG_ERROR(LOG_FEATURE_CMD, "Beacon: pixel_count=0 (start SM16703P + Init first)");
+		return;
+	}
+	if (bright < 0) bright = 0;
+	if (bright > 255) bright = 255;
+	if (clickMode < 1) clickMode = 1;
+	if (clickMode > 3) clickMode = 3;
+	if (repeats < 1) repeats = 1;
+
+	g_beacon.saveWW = CHANNEL_Get(BEACON_CH_WW);
+	g_beacon.saveCW = CHANNEL_Get(BEACON_CH_CW);
+	g_beacon.saveR = CHANNEL_Get(BEACON_CH_R);
+	g_beacon.saveG = CHANNEL_Get(BEACON_CH_G);
+	g_beacon.saveB = CHANNEL_Get(BEACON_CH_B);
+	/* if halo channels empty, fall back to led_baseColors */
+	if (g_beacon.saveR == 0 && g_beacon.saveG == 0 && g_beacon.saveB == 0) {
+		g_beacon.colR = (byte)led_baseColors[0];
+		g_beacon.colG = (byte)led_baseColors[1];
+		g_beacon.colB = (byte)led_baseColors[2];
+	} else {
+		g_beacon.colR = (byte)g_beacon.saveR;
+		g_beacon.colG = (byte)g_beacon.saveG;
+		g_beacon.colB = (byte)g_beacon.saveB;
+	}
+
+	g_beacon.bright = bright;
+	g_beacon.clickMode = clickMode;
+	g_beacon.clickTicks = BEACON_CLICK_TICKS_DEF;
+	g_beacon.repeats = repeats;
+	g_beacon.revDone = 0;
+	g_beacon.pos = 0.0f;
+	g_beacon.prevPos = 0.0f;
+	g_beacon.speed = BEACON_SPEED_LED;
+	g_beacon.clickPhase = 0;
+	g_beacon.clickStep = -1;
+	g_beacon.seamLatched = 0;
+	g_beacon.active = 1;
+
+	/* own cadence: every quick-tick */
+	g_speed = 0;
+	if (g_beaconAnimIndex >= 0) {
+		PixelAnim_SetAnim(g_beaconAnimIndex);
+	}
+	LED_SetEnableAll(true);
+
+	ADDLOG_INFO(LOG_FEATURE_CMD,
+		"Beacon: start bright=%i click=%i ticks=%i reps=%i n=%i RGB=%i,%i,%i savedWW/CW=%i/%i",
+		bright, clickMode, g_beacon.clickTicks, repeats, (int)pixel_count,
+		g_beacon.colR, g_beacon.colG, g_beacon.colB, g_beacon.saveWW, g_beacon.saveCW);
+}
+
+commandResult_t PA_Cmd_Beacon(const void *context, const char *cmd, const char *args, int flags) {
+	int anim, bright, clickMode, repeats;
+
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 4) {
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	}
+	anim = Tokenizer_GetArgInteger(0);
+	bright = Tokenizer_GetArgInteger(1);
+	clickMode = Tokenizer_GetArgInteger(2);
+	repeats = Tokenizer_GetArgInteger(3);
+	Beacon_Begin(anim, bright, clickMode, repeats);
+	return CMD_RES_OK;
+}
+
 ledAnim_t g_anims[] = {
 	{ "Rainbow Cycle", RainbowCycle_Run },
 	{ "Fire", Fire_Run },
 	{ "Shooting Star", ShootingStar_Run },
 	{ "Comet", Comet_Run },
 	{ "Theater Chase", TheaterChase_Run },
-	{ "Theater Chase Rainbow", TheaterChaseRainbow_Run }
+	{ "Theater Chase Rainbow", TheaterChaseRainbow_Run },
+	{ "Beacon", Beacon_Run }
 };
 int g_numAnims = sizeof(g_anims) / sizeof(g_anims[0]);
-int g_speed = 0;
 
 void PixelAnim_SetAnim(int j)
 {
@@ -271,6 +560,9 @@ void PixelAnim_SetAnim(int j)
 	}
 	else
 	{
+		if (g_beacon.active) {
+			Beacon_Restore();
+		}
 		MQTT_PublishMain_StringString_DeDuped(DEDUP_CURRENT_ANIM, DEDUP_EXPIRE_TIME, "currentAnim", "None", 0);
 	}
 }
@@ -299,6 +591,8 @@ commandResult_t PA_Cmd_AnimSpeed(const void *context, const char *cmd, const cha
 	return CMD_RES_OK;
 }
 void PixelAnim_Init() {
+	/* index of "Beacon" entry — last in g_anims */
+	g_beaconAnimIndex = g_numAnims - 1;
 
 	//cmddetail:{"name":"Anim","args":"[AnimationIndex]",
 	//cmddetail:"descr":"Starts given WS2812 animation by index.",
@@ -310,6 +604,11 @@ void PixelAnim_Init() {
 	//cmddetail:"fn":"PA_Cmd_AnimSpeed","file":"driver/drv_pixelAnim.c","requires":"",
 	//cmddetail:"examples":""}
 	CMD_RegisterCommand("AnimSpeed", PA_Cmd_AnimSpeed, NULL);
+	//cmddetail:{"name":"Beacon","args":"[anim][bright][click][repeats]",
+	//cmddetail:"descr":"On-device dual-sector ring beacon with optional white click; self-stop and restore.",
+	//cmddetail:"fn":"PA_Cmd_Beacon","file":"driver/drv_pixelAnim.c","requires":"",
+	//cmddetail:"examples":"Beacon 1 64 2 3"}
+	CMD_RegisterCommand("Beacon", PA_Cmd_Beacon, NULL);
 }
 
 void PixelAnim_CreatePanel(http_request_t *request) {
