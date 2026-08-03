@@ -574,7 +574,6 @@ static void Beacon_HoldWhites(void) {
 
 static void Beacon_Restore(void) {
 	int n = (int)pixel_count;
-	int i;
 
 	g_beacon.active = 0;
 	g_beacon.ambient = 0;
@@ -586,10 +585,14 @@ static void Beacon_Restore(void) {
 	g_beacon.flLevel = 0;
 	g_lightMode = Light_RGB;
 
+	/*
+	 * Full black first, then saved solid — avoids half-ring / seam garbage
+	 * when previous frame left partial SPI buffer state.
+	 */
 	if (n > 0) {
-		for (i = 0; i < n; i++) {
-			Strip_setPixel(i, g_beacon.saveR, g_beacon.saveG, g_beacon.saveB, 0, 0);
-		}
+		Strip_setAllPixels(0, 0, 0, 0, 0);
+		Strip_Apply();
+		Strip_setAllPixels(g_beacon.saveR, g_beacon.saveG, g_beacon.saveB, 0, 0);
 		Strip_Apply();
 	}
 
@@ -598,7 +601,7 @@ static void Beacon_Restore(void) {
 	CHANNEL_Set(BEACON_CH_B, g_beacon.saveB, BEACON_SET_FLAGS);
 	Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
 
-	ADDLOG_INFO(LOG_FEATURE_CMD, "Notify: restore WW=%i CW=%i RGB=%i,%i,%i",
+	ADDLOG_INFO(LOG_FEATURE_CMD, "Notify: restore (clear+fill) WW=%i CW=%i RGB=%i,%i,%i",
 		g_beacon.saveWW, g_beacon.saveCW, g_beacon.saveR, g_beacon.saveG, g_beacon.saveB);
 }
 
