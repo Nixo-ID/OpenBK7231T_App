@@ -428,6 +428,8 @@ static void Strip_ClearThenFill(int r, int g, int b) {
 	Strip_Apply();
 }
 
+static void Notify_Finish(void); /* stop Solid/Ambient before Halo owns strip */
+
 static void Main_ApplyNow(int ww, int cw) {
 	int hr, hg, hb;
 	LightRamp_CancelMain();
@@ -448,6 +450,10 @@ static void Main_ApplyNow(int ww, int cw) {
 
 static void Halo_ApplyNow(int r, int g, int b) {
 	LightRamp_CancelHalo();
+	/* Solid/Ambient keep repainting the strip every tick — stop them first */
+	if (g_beacon.active) {
+		Notify_Finish();
+	}
 	CHANNEL_Set(BEACON_CH_R, r, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_G, g, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_B, b, BEACON_SET_FLAGS);
@@ -1246,8 +1252,8 @@ commandResult_t PA_Cmd_BeaconX(const void *context, const char *cmd, const char 
 	return CMD_RES_OK;
 }
 
-/* Legacy: Beacon <anim> <bright> <clickOld> <reps> [R G B]
- * OR new-style if first arg is not small anim index: use Notify Beacon path via 7+ args */
+/* Beacon <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [clickBright]  (6+ args)
+ * Legacy: Beacon <anim> <bright> <clickOld> <reps> [R G B]  (4–7 args, first is anim idx) */
 commandResult_t PA_Cmd_Beacon(const void *context, const char *cmd, const char *args, int flags) {
 	notifyArgs_t a;
 	int narg, clickOld;
@@ -1259,18 +1265,34 @@ commandResult_t PA_Cmd_Beacon(const void *context, const char *cmd, const char *
 	if (narg < 4) {
 		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
 	}
-	/* New style: Beacon <click> <r> <g> <b> <speed> <reps> ... (6+ args, r is color) */
-	if (narg >= 6 && Tokenizer_GetArgInteger(0) <= 10 && Tokenizer_GetArgInteger(1) <= 255
-		&& Tokenizer_GetArgInteger(2) <= 255) {
-		/* ambiguous with legacy — if arg0 is 0..10 and arg1 is 0..255 treat as new if narg>=6 and bright-like */
-		/* Prefer legacy if arg0 is small anim index 1 and arg2 is clickOld 1/2/3 style */
+
+	/*
+	 * New style needs ≥6 tokens: click r g b speed reps …
+	 * Legacy is 4 tokens (anim bright clickOld reps) or +RGB (7).
+	 * Prefer new whenever narg>=6 so HA Ring works: Beacon 2 0 0 255 3 5 …
+	 */
+	if (narg >= 6) {
+		a.pattern = NOTIFY_PAT_BEACON;
+		a.clickCount = Tokenizer_GetArgInteger(0);
+		a.r = Tokenizer_GetArgInteger(1);
+		a.g = Tokenizer_GetArgInteger(2);
+		a.b = Tokenizer_GetArgInteger(3);
+		a.speedArg = Tokenizer_GetArgInteger(4);
+		a.reps = Tokenizer_GetArgInteger(5);
+		a.bright = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 255;
+		a.ramp = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 0;
+		a.clickBright = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 100;
+		a.beams = 2;
+		a.tail = BEACON_TAIL;
+		Notify_BeginEx(&a);
+		return CMD_RES_OK;
 	}
+
 	/* Legacy path: anim bright clickOld reps [R G B] */
 	a.pattern = NOTIFY_PAT_BEACON;
 	a.bright = Tokenizer_GetArgInteger(1);
 	clickOld = Tokenizer_GetArgInteger(2);
 	a.reps = Tokenizer_GetArgInteger(3);
-	a.clickCount = (clickOld >= 2) ? (clickOld == 2 ? 1 : 3) : 0;
 	if (clickOld == 2) a.clickCount = 1;
 	else if (clickOld >= 3) a.clickCount = 3;
 	else a.clickCount = 0;
