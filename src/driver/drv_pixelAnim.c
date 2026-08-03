@@ -417,25 +417,41 @@ static void Beacon_WhitesHard(int ww, int cw) {
 	CHANNEL_Set(BEACON_CH_CW, cw, BEACON_SET_FLAGS);
 }
 
+/* Full SPI frame: black then solid — kills stuck LEDs / half-ring garbage */
+static void Strip_ClearThenFill(int r, int g, int b) {
+	if (pixel_count <= 0) {
+		return;
+	}
+	Strip_setAllPixels(0, 0, 0, 0, 0);
+	Strip_Apply();
+	Strip_setAllPixels(r, g, b, 0, 0);
+	Strip_Apply();
+}
+
 static void Main_ApplyNow(int ww, int cw) {
+	int hr, hg, hb;
 	LightRamp_CancelMain();
 	CHANNEL_Set(BEACON_CH_WW, ww, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_CW, cw, BEACON_SET_FLAGS);
+	/* Re-push full ring from channel mirrors so stuck pixels die with main on */
+	hr = CHANNEL_Get(BEACON_CH_R);
+	hg = CHANNEL_Get(BEACON_CH_G);
+	hb = CHANNEL_Get(BEACON_CH_B);
+	if (hr < 0) hr = 0;
+	if (hg < 0) hg = 0;
+	if (hb < 0) hb = 0;
+	if (hr > 255) hr = 255;
+	if (hg > 255) hg = 255;
+	if (hb > 255) hb = 255;
+	Strip_ClearThenFill(hr, hg, hb);
 }
 
 static void Halo_ApplyNow(int r, int g, int b) {
-	int i, n;
 	LightRamp_CancelHalo();
 	CHANNEL_Set(BEACON_CH_R, r, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_G, g, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_B, b, BEACON_SET_FLAGS);
-	n = (int)pixel_count;
-	if (n > 0) {
-		for (i = 0; i < n; i++) {
-			Strip_setPixel(i, r, g, b, 0, 0);
-		}
-		Strip_Apply();
-	}
+	Strip_ClearThenFill(r, g, b);
 }
 
 static void Main_Begin(int ww, int cw, int ramp) {
@@ -585,20 +601,13 @@ static void Beacon_Restore(void) {
 	g_beacon.flLevel = 0;
 	g_lightMode = Light_RGB;
 
-	/*
-	 * Full black first, then saved solid — avoids half-ring / seam garbage
-	 * when previous frame left partial SPI buffer state.
-	 */
-	if (n > 0) {
-		Strip_setAllPixels(0, 0, 0, 0, 0);
-		Strip_Apply();
-		Strip_setAllPixels(g_beacon.saveR, g_beacon.saveG, g_beacon.saveB, 0, 0);
-		Strip_Apply();
-	}
-
 	CHANNEL_Set(BEACON_CH_R, g_beacon.saveR, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_G, g_beacon.saveG, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_B, g_beacon.saveB, BEACON_SET_FLAGS);
+	/* clear 0,0,0 then fill saved — same as Halo/Main rewrite */
+	if (n > 0) {
+		Strip_ClearThenFill(g_beacon.saveR, g_beacon.saveG, g_beacon.saveB);
+	}
 	Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
 
 	ADDLOG_INFO(LOG_FEATURE_CMD, "Notify: restore (clear+fill) WW=%i CW=%i RGB=%i,%i,%i",
