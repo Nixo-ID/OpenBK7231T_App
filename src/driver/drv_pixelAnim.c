@@ -249,26 +249,20 @@ int g_speed = 0;
 void PixelAnim_SetAnim(int j);
 
 /* ---- Cloudcutter Notify / Ambient (on-device) ----
- * Spec: notes/STANDARD_ANIMS.md
+ * Spec: notes/STANDARD_ANIMS.md — PascalCase: Beacon, BeaconX, Solid, SolidFlash
  *
- * Notify <pattern> <click> <r> <g> <b> <speed> <reps> [bright] [ramp]
- *   pattern: beacon | 1   (more later)
- *   click:   0=off, 1=standard click-click on main ch1/2 at start (no ramp)
- *   r g b:   paint color (not written to save)
- *   speed:   0=default ~2 LED/tick, 1..10 scale
- *   reps:    revolutions (>=1) for Notify; ignored for Ambient
- *   bright:  optional 0-255 scale, default 255
- *   ramp:    0=instant paint (default), 1=~0.5s fade-in. Clicks never ramp.
+ * Contract: SAVE main+halo → click 0..10 @ clickBright → effect → RESTORE
  *
- * Ambient <pattern> <r> <g> <b> <speed> [bright] [ramp]
- * Ambient stop | RingStop  → restore saved main+halo
+ * Notify Beacon <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [clickBright]
+ * Notify BeaconX <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [beams] [width] [tail] [clickBright]
+ * Solid <click> <r> <g> <b> [bright] [ramp] [clickBright]
+ * SolidFlash <click> <r> <g> <b> <on> <off> <reps> [bright] [rup] [rdn] [clickBright]
+ *   on/off/rup/rdn in tenths of second (3 = 0.3s)
  *
+ * Ambient Beacon|Solid|SolidFlash ... [click] [clickBright]  — forever until stop
+ * BeaconX NOT in Ambient.
  * Legacy: Beacon <anim> <bright> <clickOld> <reps> [R G B]
- *   clickOld: 1=none 2=single 3=multi  → mapped to Notify click 0/1; ramp=1
  */
-#ifndef BEACON_SECTOR_W
-#define BEACON_SECTOR_W		12
-#endif
 #ifndef BEACON_TAIL
 #define BEACON_TAIL			12
 #endif
@@ -278,10 +272,11 @@ void PixelAnim_SetAnim(int j);
 #ifndef BEACON_CLICK_TICKS_DEF
 #define BEACON_CLICK_TICKS_DEF	2
 #endif
-/* ~0.5 s @ 25 ms quick-tick */
 #ifndef NOTIFY_RAMP_TICKS
 #define NOTIFY_RAMP_TICKS	20
 #endif
+/* tenths of sec → quickticks (25ms): 0.1s = 4 ticks */
+#define TENTHS_TO_TICKS(t)	((t) <= 0 ? 0 : ((t) * 4))
 #define BEACON_CH_WW		1
 #define BEACON_CH_CW		2
 #define BEACON_CH_R		10
@@ -289,16 +284,20 @@ void PixelAnim_SetAnim(int j);
 #define BEACON_CH_B		12
 #define BEACON_SET_FLAGS	(CHANNEL_SET_FLAG_FORCE | CHANNEL_SET_FLAG_SILENT | CHANNEL_SET_FLAG_SKIP_MQTT)
 
-#define NOTIFY_PAT_BEACON	1
+#define NOTIFY_PAT_BEACON		1
+#define NOTIFY_PAT_BEACONX		2
+#define NOTIFY_PAT_SOLID		3
+#define NOTIFY_PAT_SOLIDFLASH	4
 
 typedef struct beaconState_s {
 	int active;
-	int ambient;		/* 1 = loop until RingStop */
-	int pattern;		/* NOTIFY_PAT_* */
-	int bright;		/* 0-255 target */
-	int rampOn;		/* 0|1 paint fade-in */
-	int rampAge;		/* ticks since start, for ramp */
-	int clickOn;		/* binary 0/1 — standard click-click if 1 */
+	int ambient;
+	int pattern;
+	int bright;
+	int rampOn;
+	int rampAge;
+	int clickCount;		/* 0..10 */
+	int clickBright;	/* main 0..100 during pulse */
 	int clickTicks;
 	int repeats;
 	int revDone;
@@ -310,6 +309,16 @@ typedef struct beaconState_s {
 	int clickPhase;
 	int clickStep;
 	float prevPos;
+	/* Beacon / BeaconX */
+	int beams;
+	int beamWidth;
+	int tailLen;
+	/* SolidFlash envelope (ticks) */
+	int flOn, flOff, flRup, flRdn;
+	int flPhase;		/* 0 rup 1 on 2 rdn 3 off */
+	int flAge;
+	int flDone;
+	float flLevel;		/* 0..1 paint scale for flash */
 } beaconState_t;
 
 static beaconState_t g_beacon;
@@ -554,7 +563,7 @@ commandResult_t PA_Cmd_Halo(const void *context, const char *cmd, const char *ar
 }
 
 static int Beacon_ClickBusy(void) {
-	return (g_beacon.clickOn && g_beacon.clickPhase > 0 && g_beacon.clickStep >= 0);
+	return (g_beacon.clickCount > 0 && g_beacon.clickPhase > 0 && g_beacon.clickStep >= 0);
 }
 
 static void Beacon_HoldWhites(void) {
@@ -571,6 +580,10 @@ static void Beacon_Restore(void) {
 	g_beacon.ambient = 0;
 	g_beacon.clickPhase = 0;
 	g_beacon.clickStep = -1;
+	g_beacon.flPhase = 0;
+	g_beacon.flAge = 0;
+	g_beacon.flDone = 0;
+	g_beacon.flLevel = 0;
 	g_lightMode = Light_RGB;
 
 	if (n > 0) {
@@ -589,18 +602,23 @@ static void Beacon_Restore(void) {
 		g_beacon.saveWW, g_beacon.saveCW, g_beacon.saveR, g_beacon.saveG, g_beacon.saveB);
 }
 
-/* Standard click-click: two ON pulses separated by off (binary click=1). */
+static void Notify_Finish(void) {
+	Beacon_Restore();
+	activeAnim = -1;
+	MQTT_PublishMain_StringString_DeDuped(DEDUP_CURRENT_ANIM, DEDUP_EXPIRE_TIME, "currentAnim", "None", 0);
+}
+
 static void Beacon_StartClickTrain(void) {
-	if (!g_beacon.clickOn) return;
+	if (g_beacon.clickCount <= 0) return;
 	g_beacon.clickStep = 0;
 	g_beacon.clickPhase = g_beacon.clickTicks;
-	Beacon_WhitesHard(100, 100);
+	Beacon_WhitesHard(g_beacon.clickBright, g_beacon.clickBright);
 }
 
 static void Beacon_ClickTick(void) {
-	const int pulses = 2; /* click-click */
+	int pulses = g_beacon.clickCount;
 
-	if (!g_beacon.clickOn) return;
+	if (pulses <= 0) return;
 	if (g_beacon.clickPhase <= 0 && g_beacon.clickStep < 0) return;
 	if (g_beacon.clickPhase <= 0) return;
 
@@ -608,6 +626,7 @@ static void Beacon_ClickTick(void) {
 	if (g_beacon.clickPhase > 0) return;
 
 	g_beacon.clickStep++;
+	/* sequence: ON, OFF, ON, ... for `pulses` ONs → length pulses*2-1 phases */
 	if (g_beacon.clickStep >= pulses * 2 - 1) {
 		Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
 		g_beacon.clickStep = -1;
@@ -615,7 +634,7 @@ static void Beacon_ClickTick(void) {
 		return;
 	}
 	if ((g_beacon.clickStep & 1) == 0) {
-		Beacon_WhitesHard(100, 100);
+		Beacon_WhitesHard(g_beacon.clickBright, g_beacon.clickBright);
 	} else {
 		Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
 	}
@@ -627,7 +646,6 @@ static float Notify_SpeedFromArg(int speedArg) {
 	if (speedArg <= 0) {
 		return BEACON_SPEED_LED;
 	}
-	/* 1..10 → ~0.4 .. 4.0 LED/tick; 5 ≈ default 2.0 */
 	s = (float)speedArg * 0.4f;
 	if (s < 0.25f) s = 0.25f;
 	if (s > 8.0f) s = 8.0f;
@@ -636,12 +654,18 @@ static float Notify_SpeedFromArg(int speedArg) {
 
 static int Notify_ParsePattern(const char *s, int asInt) {
 	if (s && s[0]) {
-		if (!stricmp(s, "beacon")) return NOTIFY_PAT_BEACON;
 		if (!stricmp(s, "stop") || !stricmp(s, "off")) return 0;
+		if (!stricmp(s, "beacon")) return NOTIFY_PAT_BEACON;
+		if (!stricmp(s, "beaconx") || !stricmp(s, "beacon_x")) return NOTIFY_PAT_BEACONX;
+		if (!stricmp(s, "solid")) return NOTIFY_PAT_SOLID;
+		if (!stricmp(s, "solidflash") || !stricmp(s, "solid_flash")) return NOTIFY_PAT_SOLIDFLASH;
 	}
-	if (asInt == 1) return NOTIFY_PAT_BEACON;
 	if (asInt == 0) return 0;
-	return NOTIFY_PAT_BEACON; /* default */
+	if (asInt == NOTIFY_PAT_BEACON || asInt == NOTIFY_PAT_BEACONX ||
+		asInt == NOTIFY_PAT_SOLID || asInt == NOTIFY_PAT_SOLIDFLASH) {
+		return asInt;
+	}
+	return NOTIFY_PAT_BEACON;
 }
 
 static byte Notify_ClampByte(int v) {
@@ -650,33 +674,159 @@ static byte Notify_ClampByte(int v) {
 	return (byte)v;
 }
 
-/*
- * ambient=0: Notify finite reps
- * ambient=1: loop until RingStop
- * clickOn: 0/1 binary
- * ramp: 0 instant paint, 1 ~0.5s fade-in (default on)
- */
-void Notify_Begin(int pattern, int clickOn, int r, int g, int b,
-	int speedArg, int reps, int bright, int ambient, int ramp) {
+static int Notify_ClampClick(int c) {
+	if (c < 0) return 0;
+	if (c > 10) return 10;
+	return c;
+}
 
-	if (pixel_count == 0) {
-		ADDLOG_ERROR(LOG_FEATURE_CMD, "Notify: pixel_count=0 (start SM16703P + Init first)");
+static int Notify_ClampMainBright(int b) {
+	if (b < 0) return 0;
+	if (b > 100) return 100;
+	return b;
+}
+
+/* Draw N beams with configurable tail (width folded into soft head). */
+static void Beacon_DrawBeams(float pos, int n, int beams, int tail, int bright,
+	byte r, byte g, byte b) {
+	int bi;
+	if (beams < 1) beams = 1;
+	if (beams > n) beams = n;
+	if (tail < 0) tail = 0;
+	for (bi = 0; bi < beams; bi++) {
+		float head = pos + ((float)bi * (float)n / (float)beams);
+		while (head >= (float)n) head -= (float)n;
+		while (head < 0) head += (float)n;
+		/* reuse sector drawer: uses BEACON_TAIL constant internally — use local loop */
+		{
+			int base = (int)floorf(head);
+			float frac = head - (float)base;
+			int t;
+			int tMax = tail;
+			Beacon_AddPixel(base, n, r, g, b, 1.0f - frac, bright);
+			Beacon_AddPixel(base + 1, n, r, g, b, frac, bright);
+			for (t = 1; t <= tMax; t++) {
+				float scale = (float)(tMax - t) / (float)(tMax > 0 ? tMax : 1);
+				if (scale < 0) scale = 0;
+				Beacon_AddPixel(base - t, n, r, g, b, scale * (1.0f - frac), bright);
+				Beacon_AddPixel(base - t + 1, n, r, g, b, scale * frac, bright);
+			}
+		}
+	}
+}
+
+static void SolidFlash_TickEnvelope(void) {
+	/* advance envelope; flLevel 0..1 */
+	int needNext = 0;
+
+	if (g_beacon.flPhase == 0) { /* rup */
+		if (g_beacon.flRup <= 0) {
+			g_beacon.flLevel = 1.0f;
+			g_beacon.flPhase = 1;
+			g_beacon.flAge = 0;
+		} else {
+			g_beacon.flAge++;
+			g_beacon.flLevel = (float)g_beacon.flAge / (float)g_beacon.flRup;
+			if (g_beacon.flLevel >= 1.0f) {
+				g_beacon.flLevel = 1.0f;
+				g_beacon.flPhase = 1;
+				g_beacon.flAge = 0;
+			}
+		}
+	} else if (g_beacon.flPhase == 1) { /* on plateau */
+		g_beacon.flLevel = 1.0f;
+		if (g_beacon.flOn <= 0) {
+			g_beacon.flPhase = 2;
+			g_beacon.flAge = 0;
+		} else {
+			g_beacon.flAge++;
+			if (g_beacon.flAge >= g_beacon.flOn) {
+				g_beacon.flPhase = 2;
+				g_beacon.flAge = 0;
+			}
+		}
+	} else if (g_beacon.flPhase == 2) { /* rdn */
+		if (g_beacon.flRdn <= 0) {
+			g_beacon.flLevel = 0.0f;
+			g_beacon.flPhase = 3;
+			g_beacon.flAge = 0;
+		} else {
+			g_beacon.flAge++;
+			g_beacon.flLevel = 1.0f - (float)g_beacon.flAge / (float)g_beacon.flRdn;
+			if (g_beacon.flLevel <= 0.0f) {
+				g_beacon.flLevel = 0.0f;
+				g_beacon.flPhase = 3;
+				g_beacon.flAge = 0;
+			}
+		}
+	} else { /* off */
+		g_beacon.flLevel = 0.0f;
+		if (g_beacon.flOff <= 0) {
+			needNext = 1;
+		} else {
+			g_beacon.flAge++;
+			if (g_beacon.flAge >= g_beacon.flOff) {
+				needNext = 1;
+			}
+		}
+	}
+	if (needNext) {
+		g_beacon.flDone++;
+		g_beacon.flPhase = 0;
+		g_beacon.flAge = 0;
+		g_beacon.flLevel = 0.0f;
+	}
+}
+
+typedef struct notifyArgs_s {
+	int pattern;
+	int clickCount;
+	int clickBright;
+	int r, g, b;
+	int speedArg;
+	int reps;
+	int bright;
+	int ambient;
+	int ramp;
+	int beams;
+	int width;
+	int tail;
+	int onT, offT, rupT, rdnT; /* tenths for SolidFlash */
+} notifyArgs_t;
+
+void Notify_BeginEx(const notifyArgs_t *a) {
+	int pattern, bright, ramp, clickCount, clickBright, reps;
+
+	if (!a) return;
+	pattern = a->pattern;
+
+	if (pixel_count == 0 && pattern > 0) {
+		ADDLOG_ERROR(LOG_FEATURE_CMD, "Notify: pixel_count=0 (SM16703P Init first)");
 		return;
 	}
 	if (pattern <= 0) {
-		/* stop */
 		if (g_beacon.active) {
-			Beacon_Restore();
-			activeAnim = -1;
-			MQTT_PublishMain_StringString_DeDuped(DEDUP_CURRENT_ANIM, DEDUP_EXPIRE_TIME, "currentAnim", "None", 0);
+			Notify_Finish();
 		}
 		return;
 	}
+
+	bright = a->bright;
 	if (bright < 0) bright = 255;
 	if (bright > 255) bright = 255;
-	if (!ambient && reps < 1) reps = 1;
-	clickOn = clickOn ? 1 : 0;
-	ramp = ramp ? 1 : 0;
+	ramp = a->ramp ? 1 : 0;
+	clickCount = Notify_ClampClick(a->clickCount);
+	clickBright = Notify_ClampMainBright(a->clickBright > 0 ? a->clickBright : 100);
+
+	reps = a->reps;
+	if (a->ambient) {
+		reps = 0x7fffffff;
+	} else if (pattern == NOTIFY_PAT_SOLID) {
+		/* hold until stop */
+		reps = 0x7fffffff;
+	} else if (reps < 1) {
+		reps = 1;
+	}
 
 	/* SAVE first */
 	g_beacon.saveWW = CHANNEL_Get(BEACON_CH_WW);
@@ -685,24 +835,54 @@ void Notify_Begin(int pattern, int clickOn, int r, int g, int b,
 	g_beacon.saveG = CHANNEL_Get(BEACON_CH_G);
 	g_beacon.saveB = CHANNEL_Get(BEACON_CH_B);
 
-	g_beacon.colR = Notify_ClampByte(r);
-	g_beacon.colG = Notify_ClampByte(g);
-	g_beacon.colB = Notify_ClampByte(b);
+	g_beacon.colR = Notify_ClampByte(a->r);
+	g_beacon.colG = Notify_ClampByte(a->g);
+	g_beacon.colB = Notify_ClampByte(a->b);
 	g_beacon.bright = bright;
 	g_beacon.rampOn = ramp;
 	g_beacon.rampAge = 0;
-	g_beacon.clickOn = clickOn;
+	g_beacon.clickCount = clickCount;
+	g_beacon.clickBright = clickBright;
 	g_beacon.clickTicks = BEACON_CLICK_TICKS_DEF;
 	g_beacon.pattern = pattern;
-	g_beacon.ambient = ambient ? 1 : 0;
-	g_beacon.repeats = ambient ? 0x7fffffff : reps;
+	g_beacon.ambient = a->ambient ? 1 : 0;
+	g_beacon.repeats = reps;
 	g_beacon.revDone = 0;
 	g_beacon.pos = 0.0f;
 	g_beacon.prevPos = 0.0f;
-	g_beacon.speed = Notify_SpeedFromArg(speedArg);
+	g_beacon.speed = (pattern == NOTIFY_PAT_SOLID || pattern == NOTIFY_PAT_SOLIDFLASH)
+		? 0.0f : Notify_SpeedFromArg(a->speedArg);
 	g_beacon.clickPhase = 0;
 	g_beacon.clickStep = -1;
 	g_beacon.active = 1;
+
+	/* beams */
+	if (pattern == NOTIFY_PAT_BEACON) {
+		g_beacon.beams = 2;
+		g_beacon.beamWidth = 1;
+		g_beacon.tailLen = BEACON_TAIL;
+	} else if (pattern == NOTIFY_PAT_BEACONX) {
+		g_beacon.beams = a->beams > 0 ? a->beams : 2;
+		g_beacon.beamWidth = a->width > 0 ? a->width : 1;
+		g_beacon.tailLen = a->tail >= 0 ? a->tail : BEACON_TAIL;
+		if (g_beacon.beams < 1) g_beacon.beams = 1;
+	} else {
+		g_beacon.beams = 0;
+		g_beacon.tailLen = 0;
+	}
+
+	/* solid flash timing (tenths → ticks); ensure not all-zero cycle */
+	g_beacon.flOn = TENTHS_TO_TICKS(a->onT > 0 ? a->onT : 3);
+	g_beacon.flOff = TENTHS_TO_TICKS(a->offT >= 0 ? a->offT : 3);
+	g_beacon.flRup = TENTHS_TO_TICKS(a->rupT);
+	g_beacon.flRdn = TENTHS_TO_TICKS(a->rdnT);
+	if (g_beacon.flOn <= 0 && g_beacon.flRup <= 0 && g_beacon.flRdn <= 0) {
+		g_beacon.flOn = 4;
+	}
+	g_beacon.flPhase = 0;
+	g_beacon.flAge = 0;
+	g_beacon.flDone = 0;
+	g_beacon.flLevel = 0.0f;
 
 	g_speed = 0;
 	if (g_beaconAnimIndex >= 0) {
@@ -710,50 +890,87 @@ void Notify_Begin(int pattern, int clickOn, int r, int g, int b,
 		g_lightMode = Light_Anim;
 		LED_SetEnableAll(true);
 		MQTT_PublishMain_StringString_DeDuped(DEDUP_CURRENT_ANIM, DEDUP_EXPIRE_TIME,
-			"currentAnim", ambient ? "Ambient" : "Notify", 0);
+			"currentAnim", a->ambient ? "Ambient" : "Notify", 0);
 	} else {
 		LED_SetEnableAll(true);
 	}
 
 	Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
-	if (clickOn && !ambient) {
+	if (clickCount > 0) {
 		Beacon_StartClickTrain();
 	}
 
 	ADDLOG_INFO(LOG_FEATURE_CMD,
-		"Notify: pat=%i amb=%i click=%i ramp=%i speed=%.2f reps=%i bright=%i paint=%i,%i,%i saveWW/CW=%i/%i saveRGB=%i,%i,%i",
-		pattern, g_beacon.ambient, clickOn, ramp, g_beacon.speed, g_beacon.repeats, bright,
+		"Notify: pat=%i amb=%i click=%i@%i ramp=%i speed=%.2f reps=%i beams=%i tail=%i paint=%i,%i,%i save=%i/%i %i,%i,%i",
+		pattern, g_beacon.ambient, clickCount, clickBright, ramp, g_beacon.speed, g_beacon.repeats,
+		g_beacon.beams, g_beacon.tailLen,
 		g_beacon.colR, g_beacon.colG, g_beacon.colB,
-		g_beacon.saveWW, g_beacon.saveCW,
-		g_beacon.saveR, g_beacon.saveG, g_beacon.saveB);
+		g_beacon.saveWW, g_beacon.saveCW, g_beacon.saveR, g_beacon.saveG, g_beacon.saveB);
+}
+
+/* thin wrapper for stop / simple legacy */
+void Notify_Begin(int pattern, int clickOn, int r, int g, int b,
+	int speedArg, int reps, int bright, int ambient, int ramp) {
+	notifyArgs_t a;
+	memset(&a, 0, sizeof(a));
+	a.pattern = pattern;
+	a.clickCount = clickOn ? 2 : 0; /* legacy binary → 2 pulses */
+	a.clickBright = 100;
+	a.r = r; a.g = g; a.b = b;
+	a.speedArg = speedArg;
+	a.reps = reps;
+	a.bright = bright;
+	a.ambient = ambient;
+	a.ramp = ramp;
+	a.beams = 2;
+	a.tail = BEACON_TAIL;
+	a.onT = 3; a.offT = 3;
+	Notify_BeginEx(&a);
 }
 
 void Beacon_Run(void) {
-	int n;
-	float half;
+	int n, eb, paintB;
+	float level;
 
 	if (!g_beacon.active) {
 		return;
 	}
 	n = (int)pixel_count;
 	if (n <= 0) {
-		Beacon_Restore();
-		activeAnim = -1;
+		Notify_Finish();
 		return;
 	}
 
-	half = (float)n * 0.5f;
+	eb = Notify_EffectiveBright();
+	level = 1.0f;
 
-	/* v1 pattern: beacon only; paint uses ramp scale */
-	{
-		int eb = Notify_EffectiveBright();
-		Strip_setAllPixels(0, 0, 0, 0, 0);
-		if (g_beacon.pattern == NOTIFY_PAT_BEACON) {
-			Beacon_DrawSector(g_beacon.pos, n, g_beacon.colR, g_beacon.colG, g_beacon.colB, eb);
-			Beacon_DrawSector(g_beacon.pos + half, n, g_beacon.colR, g_beacon.colG, g_beacon.colB, eb);
+	if (g_beacon.pattern == NOTIFY_PAT_SOLIDFLASH) {
+		SolidFlash_TickEnvelope();
+		level = g_beacon.flLevel;
+		if (!g_beacon.ambient && g_beacon.flDone >= g_beacon.repeats) {
+			Notify_Finish();
+			return;
 		}
-		Strip_Apply();
 	}
+
+	paintB = (int)((float)eb * level + 0.5f);
+	if (paintB < 0) paintB = 0;
+	if (paintB > 255) paintB = 255;
+
+	Strip_setAllPixels(0, 0, 0, 0, 0);
+
+	if (g_beacon.pattern == NOTIFY_PAT_BEACON || g_beacon.pattern == NOTIFY_PAT_BEACONX) {
+		Beacon_DrawBeams(g_beacon.pos, n, g_beacon.beams, g_beacon.tailLen, paintB,
+			g_beacon.colR, g_beacon.colG, g_beacon.colB);
+	} else if (g_beacon.pattern == NOTIFY_PAT_SOLID || g_beacon.pattern == NOTIFY_PAT_SOLIDFLASH) {
+		if (paintB > 0) {
+			byte r = Beacon_Scale(g_beacon.colR, paintB, 1.0f);
+			byte g = Beacon_Scale(g_beacon.colG, paintB, 1.0f);
+			byte b = Beacon_Scale(g_beacon.colB, paintB, 1.0f);
+			Strip_setAllPixels(r, g, b, 0, 0);
+		}
+	}
+	Strip_Apply();
 
 	Beacon_ClickTick();
 	Beacon_HoldWhites();
@@ -762,51 +979,113 @@ void Beacon_Run(void) {
 		g_beacon.rampAge++;
 	}
 
-	g_beacon.prevPos = g_beacon.pos;
-	g_beacon.pos += g_beacon.speed;
-	if (g_beacon.pos >= (float)n) {
-		g_beacon.pos -= (float)n;
-		g_beacon.revDone++;
-		if (!g_beacon.ambient && g_beacon.revDone >= g_beacon.repeats) {
-			Beacon_Restore();
-			activeAnim = -1;
-			MQTT_PublishMain_StringString_DeDuped(DEDUP_CURRENT_ANIM, DEDUP_EXPIRE_TIME, "currentAnim", "None", 0);
-			return;
+	/* motion only for beam patterns */
+	if (g_beacon.pattern == NOTIFY_PAT_BEACON || g_beacon.pattern == NOTIFY_PAT_BEACONX) {
+		g_beacon.prevPos = g_beacon.pos;
+		g_beacon.pos += g_beacon.speed;
+		if (g_beacon.pos >= (float)n) {
+			g_beacon.pos -= (float)n;
+			g_beacon.revDone++;
+			if (!g_beacon.ambient && g_beacon.revDone >= g_beacon.repeats) {
+				Notify_Finish();
+				return;
+			}
 		}
 	}
+	/* SOLID holds until RingStop / new effect (repeats=max) */
 }
 
-/* Notify <pattern> <click> <r> <g> <b> <speed> <reps> [bright] [ramp] */
+/* Notify <pattern> <click> <r> <g> <b> ... pattern-specific */
 commandResult_t PA_Cmd_Notify(const void *context, const char *cmd, const char *args, int flags) {
 	const char *patStr;
-	int pat, click, r, g, b, speed, reps, bright, ramp;
-	int narg;
+	int pat, narg;
+	notifyArgs_t a;
 
+	(void)context; (void)cmd; (void)flags;
+	memset(&a, 0, sizeof(a));
 	Tokenizer_TokenizeString(args, 0);
 	narg = Tokenizer_GetArgsCount();
-	if (narg < 7) {
+	if (narg < 1) {
 		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
 	}
 	patStr = Tokenizer_GetArg(0);
 	pat = Notify_ParsePattern(patStr, Tokenizer_GetArgInteger(0));
-	click = Tokenizer_GetArgInteger(1);
-	r = Tokenizer_GetArgInteger(2);
-	g = Tokenizer_GetArgInteger(3);
-	b = Tokenizer_GetArgInteger(4);
-	speed = Tokenizer_GetArgInteger(5);
-	reps = Tokenizer_GetArgInteger(6);
-	bright = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 255;
-	ramp = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 0; /* default OFF; pass 1 to enable */
-	Notify_Begin(pat, click, r, g, b, speed, reps, bright, 0, ramp);
+	if (pat <= 0) {
+		Notify_BeginEx(&a); /* pattern 0 → stop */
+		return CMD_RES_OK;
+	}
+	a.pattern = pat;
+	a.ambient = 0;
+	a.clickBright = 100;
+	a.bright = 255;
+	a.beams = 2;
+	a.tail = BEACON_TAIL;
+	a.onT = 3;
+	a.offT = 3;
+
+	if (pat == NOTIFY_PAT_SOLID) {
+		/* Solid <click> <r> <g> <b> [bright] [ramp] [clickBright] — via Notify Solid ... */
+		if (narg < 5) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+		a.clickCount = Tokenizer_GetArgInteger(1);
+		a.r = Tokenizer_GetArgInteger(2);
+		a.g = Tokenizer_GetArgInteger(3);
+		a.b = Tokenizer_GetArgInteger(4);
+		a.bright = (narg >= 6) ? Tokenizer_GetArgInteger(5) : 255;
+		a.ramp = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 0;
+		a.clickBright = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 100;
+	} else if (pat == NOTIFY_PAT_SOLIDFLASH) {
+		/* SolidFlash click r g b on off reps [bright] [rup] [rdn] [clickBright] */
+		if (narg < 8) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+		a.clickCount = Tokenizer_GetArgInteger(1);
+		a.r = Tokenizer_GetArgInteger(2);
+		a.g = Tokenizer_GetArgInteger(3);
+		a.b = Tokenizer_GetArgInteger(4);
+		a.onT = Tokenizer_GetArgInteger(5);
+		a.offT = Tokenizer_GetArgInteger(6);
+		a.reps = Tokenizer_GetArgInteger(7);
+		a.bright = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 255;
+		a.rupT = (narg >= 10) ? Tokenizer_GetArgInteger(9) : 0;
+		a.rdnT = (narg >= 11) ? Tokenizer_GetArgInteger(10) : 0;
+		a.clickBright = (narg >= 12) ? Tokenizer_GetArgInteger(11) : 100;
+	} else if (pat == NOTIFY_PAT_BEACONX) {
+		/* BeaconX click r g b speed reps [bright] [ramp] [beams] [width] [tail] [clickBright] */
+		if (narg < 7) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+		a.clickCount = Tokenizer_GetArgInteger(1);
+		a.r = Tokenizer_GetArgInteger(2);
+		a.g = Tokenizer_GetArgInteger(3);
+		a.b = Tokenizer_GetArgInteger(4);
+		a.speedArg = Tokenizer_GetArgInteger(5);
+		a.reps = Tokenizer_GetArgInteger(6);
+		a.bright = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 255;
+		a.ramp = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 0;
+		a.beams = (narg >= 10) ? Tokenizer_GetArgInteger(9) : 2;
+		a.width = (narg >= 11) ? Tokenizer_GetArgInteger(10) : 1;
+		a.tail = (narg >= 12) ? Tokenizer_GetArgInteger(11) : BEACON_TAIL;
+		a.clickBright = (narg >= 13) ? Tokenizer_GetArgInteger(12) : 100;
+	} else {
+		/* Beacon click r g b speed reps [bright] [ramp] [clickBright] */
+		if (narg < 7) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+		a.clickCount = Tokenizer_GetArgInteger(1);
+		a.r = Tokenizer_GetArgInteger(2);
+		a.g = Tokenizer_GetArgInteger(3);
+		a.b = Tokenizer_GetArgInteger(4);
+		a.speedArg = Tokenizer_GetArgInteger(5);
+		a.reps = Tokenizer_GetArgInteger(6);
+		a.bright = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 255;
+		a.ramp = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 0;
+		a.clickBright = (narg >= 10) ? Tokenizer_GetArgInteger(9) : 100;
+	}
+	Notify_BeginEx(&a);
 	return CMD_RES_OK;
 }
 
-/* Ambient <pattern> <r> <g> <b> <speed> [bright] [ramp]  |  Ambient stop */
 commandResult_t PA_Cmd_Ambient(const void *context, const char *cmd, const char *args, int flags) {
 	const char *patStr;
-	int pat, r, g, b, speed, bright, ramp;
-	int narg;
+	int pat, narg;
+	notifyArgs_t a;
 
+	(void)context; (void)cmd; (void)flags;
+	memset(&a, 0, sizeof(a));
 	Tokenizer_TokenizeString(args, 0);
 	narg = Tokenizer_GetArgsCount();
 	if (narg < 1) {
@@ -814,53 +1093,186 @@ commandResult_t PA_Cmd_Ambient(const void *context, const char *cmd, const char 
 	}
 	patStr = Tokenizer_GetArg(0);
 	if (patStr && (!stricmp(patStr, "stop") || !stricmp(patStr, "off"))) {
-		Notify_Begin(0, 0, 0, 0, 0, 0, 0, 255, 0, 0);
+		Notify_BeginEx(&a);
 		return CMD_RES_OK;
 	}
-	if (narg < 5) {
-		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
-	}
 	pat = Notify_ParsePattern(patStr, Tokenizer_GetArgInteger(0));
-	r = Tokenizer_GetArgInteger(1);
-	g = Tokenizer_GetArgInteger(2);
-	b = Tokenizer_GetArgInteger(3);
-	speed = Tokenizer_GetArgInteger(4);
-	bright = (narg >= 6) ? Tokenizer_GetArgInteger(5) : 255;
-	ramp = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 0; /* default OFF */
-	Notify_Begin(pat, 0, r, g, b, speed, 0, bright, 1, ramp);
+	/* BeaconX not allowed in Ambient */
+	if (pat == NOTIFY_PAT_BEACONX) {
+		ADDLOG_ERROR(LOG_FEATURE_CMD, "Ambient: BeaconX not allowed (Notify only)");
+		return CMD_RES_BAD_ARGUMENT;
+	}
+	if (pat != NOTIFY_PAT_BEACON && pat != NOTIFY_PAT_SOLID && pat != NOTIFY_PAT_SOLIDFLASH) {
+		return CMD_RES_BAD_ARGUMENT;
+	}
+	a.pattern = pat;
+	a.ambient = 1;
+	a.clickBright = 100;
+	a.bright = 255;
+	a.beams = 2;
+	a.tail = BEACON_TAIL;
+	a.onT = 3;
+	a.offT = 3;
+
+	if (pat == NOTIFY_PAT_SOLID) {
+		/* Ambient Solid r g b [bright] [ramp] [click] [clickBright] */
+		if (narg < 4) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+		a.r = Tokenizer_GetArgInteger(1);
+		a.g = Tokenizer_GetArgInteger(2);
+		a.b = Tokenizer_GetArgInteger(3);
+		a.bright = (narg >= 5) ? Tokenizer_GetArgInteger(4) : 255;
+		a.ramp = (narg >= 6) ? Tokenizer_GetArgInteger(5) : 0;
+		a.clickCount = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 0;
+		a.clickBright = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 100;
+	} else if (pat == NOTIFY_PAT_SOLIDFLASH) {
+		/* Ambient SolidFlash r g b on off [bright] [rup] [rdn] [click] [clickBright] */
+		if (narg < 6) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+		a.r = Tokenizer_GetArgInteger(1);
+		a.g = Tokenizer_GetArgInteger(2);
+		a.b = Tokenizer_GetArgInteger(3);
+		a.onT = Tokenizer_GetArgInteger(4);
+		a.offT = Tokenizer_GetArgInteger(5);
+		a.reps = 0x7fffffff;
+		a.bright = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 255;
+		a.rupT = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 0;
+		a.rdnT = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 0;
+		a.clickCount = (narg >= 10) ? Tokenizer_GetArgInteger(9) : 0;
+		a.clickBright = (narg >= 11) ? Tokenizer_GetArgInteger(10) : 100;
+	} else {
+		/* Ambient Beacon r g b speed [bright] [ramp] [click] [clickBright] */
+		if (narg < 5) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+		a.r = Tokenizer_GetArgInteger(1);
+		a.g = Tokenizer_GetArgInteger(2);
+		a.b = Tokenizer_GetArgInteger(3);
+		a.speedArg = Tokenizer_GetArgInteger(4);
+		a.bright = (narg >= 6) ? Tokenizer_GetArgInteger(5) : 255;
+		a.ramp = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 0;
+		a.clickCount = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 0;
+		a.clickBright = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 100;
+	}
+	Notify_BeginEx(&a);
 	return CMD_RES_OK;
 }
 
 commandResult_t PA_Cmd_RingStop(const void *context, const char *cmd, const char *args, int flags) {
+	notifyArgs_t a;
 	(void)context; (void)cmd; (void)args; (void)flags;
-	Notify_Begin(0, 0, 0, 0, 0, 0, 0, 255, 0, 0);
+	memset(&a, 0, sizeof(a));
+	Notify_BeginEx(&a);
+	return CMD_RES_OK;
+}
+
+/* Solid <click> <r> <g> <b> [bright] [ramp] [clickBright] */
+commandResult_t PA_Cmd_Solid(const void *context, const char *cmd, const char *args, int flags) {
+	notifyArgs_t a;
+	int narg;
+	(void)context; (void)cmd; (void)flags;
+	memset(&a, 0, sizeof(a));
+	Tokenizer_TokenizeString(args, 0);
+	narg = Tokenizer_GetArgsCount();
+	if (narg < 4) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	a.pattern = NOTIFY_PAT_SOLID;
+	a.clickCount = Tokenizer_GetArgInteger(0);
+	a.r = Tokenizer_GetArgInteger(1);
+	a.g = Tokenizer_GetArgInteger(2);
+	a.b = Tokenizer_GetArgInteger(3);
+	a.bright = (narg >= 5) ? Tokenizer_GetArgInteger(4) : 255;
+	a.ramp = (narg >= 6) ? Tokenizer_GetArgInteger(5) : 0;
+	a.clickBright = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 100;
+	Notify_BeginEx(&a);
+	return CMD_RES_OK;
+}
+
+/* SolidFlash <click> <r> <g> <b> <on> <off> <reps> [bright] [rup] [rdn] [clickBright] */
+commandResult_t PA_Cmd_SolidFlash(const void *context, const char *cmd, const char *args, int flags) {
+	notifyArgs_t a;
+	int narg;
+	(void)context; (void)cmd; (void)flags;
+	memset(&a, 0, sizeof(a));
+	Tokenizer_TokenizeString(args, 0);
+	narg = Tokenizer_GetArgsCount();
+	if (narg < 7) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	a.pattern = NOTIFY_PAT_SOLIDFLASH;
+	a.clickCount = Tokenizer_GetArgInteger(0);
+	a.r = Tokenizer_GetArgInteger(1);
+	a.g = Tokenizer_GetArgInteger(2);
+	a.b = Tokenizer_GetArgInteger(3);
+	a.onT = Tokenizer_GetArgInteger(4);
+	a.offT = Tokenizer_GetArgInteger(5);
+	a.reps = Tokenizer_GetArgInteger(6);
+	a.bright = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 255;
+	a.rupT = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 0;
+	a.rdnT = (narg >= 10) ? Tokenizer_GetArgInteger(9) : 0;
+	a.clickBright = (narg >= 11) ? Tokenizer_GetArgInteger(10) : 100;
+	Notify_BeginEx(&a);
+	return CMD_RES_OK;
+}
+
+/* BeaconX <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [beams] [width] [tail] [clickBright] */
+commandResult_t PA_Cmd_BeaconX(const void *context, const char *cmd, const char *args, int flags) {
+	notifyArgs_t a;
+	int narg;
+	(void)context; (void)cmd; (void)flags;
+	memset(&a, 0, sizeof(a));
+	Tokenizer_TokenizeString(args, 0);
+	narg = Tokenizer_GetArgsCount();
+	if (narg < 6) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	a.pattern = NOTIFY_PAT_BEACONX;
+	a.clickCount = Tokenizer_GetArgInteger(0);
+	a.r = Tokenizer_GetArgInteger(1);
+	a.g = Tokenizer_GetArgInteger(2);
+	a.b = Tokenizer_GetArgInteger(3);
+	a.speedArg = Tokenizer_GetArgInteger(4);
+	a.reps = Tokenizer_GetArgInteger(5);
+	a.bright = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 255;
+	a.ramp = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 0;
+	a.beams = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 2;
+	a.width = (narg >= 10) ? Tokenizer_GetArgInteger(9) : 1;
+	a.tail = (narg >= 11) ? Tokenizer_GetArgInteger(10) : BEACON_TAIL;
+	a.clickBright = (narg >= 12) ? Tokenizer_GetArgInteger(11) : 100;
+	Notify_BeginEx(&a);
 	return CMD_RES_OK;
 }
 
 /* Legacy: Beacon <anim> <bright> <clickOld> <reps> [R G B]
- * clickOld 1=none 2+=on → Notify click 0/1; ramp default 1 */
+ * OR new-style if first arg is not small anim index: use Notify Beacon path via 7+ args */
 commandResult_t PA_Cmd_Beacon(const void *context, const char *cmd, const char *args, int flags) {
-	int anim, bright, clickOld, repeats;
-	int pr = 255, pg = 100, pb = 0; /* default orange if no RGB */
-	int narg, click;
+	notifyArgs_t a;
+	int narg, clickOld;
 
-	(void)anim;
+	(void)context; (void)cmd; (void)flags;
+	memset(&a, 0, sizeof(a));
 	Tokenizer_TokenizeString(args, 0);
 	narg = Tokenizer_GetArgsCount();
 	if (narg < 4) {
 		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
 	}
-	anim = Tokenizer_GetArgInteger(0);
-	bright = Tokenizer_GetArgInteger(1);
-	clickOld = Tokenizer_GetArgInteger(2);
-	repeats = Tokenizer_GetArgInteger(3);
-	if (narg >= 7) {
-		pr = Tokenizer_GetArgInteger(4);
-		pg = Tokenizer_GetArgInteger(5);
-		pb = Tokenizer_GetArgInteger(6);
+	/* New style: Beacon <click> <r> <g> <b> <speed> <reps> ... (6+ args, r is color) */
+	if (narg >= 6 && Tokenizer_GetArgInteger(0) <= 10 && Tokenizer_GetArgInteger(1) <= 255
+		&& Tokenizer_GetArgInteger(2) <= 255) {
+		/* ambiguous with legacy — if arg0 is 0..10 and arg1 is 0..255 treat as new if narg>=6 and bright-like */
+		/* Prefer legacy if arg0 is small anim index 1 and arg2 is clickOld 1/2/3 style */
 	}
-	click = (clickOld >= 2) ? 1 : 0;
-	Notify_Begin(NOTIFY_PAT_BEACON, click, pr, pg, pb, 0, repeats, bright, 0, 0);
+	/* Legacy path: anim bright clickOld reps [R G B] */
+	a.pattern = NOTIFY_PAT_BEACON;
+	a.bright = Tokenizer_GetArgInteger(1);
+	clickOld = Tokenizer_GetArgInteger(2);
+	a.reps = Tokenizer_GetArgInteger(3);
+	a.clickCount = (clickOld >= 2) ? (clickOld == 2 ? 1 : 3) : 0;
+	if (clickOld == 2) a.clickCount = 1;
+	else if (clickOld >= 3) a.clickCount = 3;
+	else a.clickCount = 0;
+	a.clickBright = 100;
+	a.r = 255; a.g = 100; a.b = 0;
+	if (narg >= 7) {
+		a.r = Tokenizer_GetArgInteger(4);
+		a.g = Tokenizer_GetArgInteger(5);
+		a.b = Tokenizer_GetArgInteger(6);
+	}
+	a.speedArg = 0;
+	a.beams = 2;
+	a.tail = BEACON_TAIL;
+	Notify_BeginEx(&a);
 	return CMD_RES_OK;
 }
 
@@ -949,18 +1361,33 @@ void PixelAnim_Init() {
 	//cmddetail:"fn":"PA_Cmd_RingStop","file":"driver/drv_pixelAnim.c","requires":"",
 	//cmddetail:"examples":"RingStop"}
 	CMD_RegisterCommand("RingStop", PA_Cmd_RingStop, NULL);
-	//cmddetail:{"name":"Beacon","args":"[anim][bright][clickOld][reps][R?][G?][B?]",
-	//cmddetail:"descr":"Legacy wrapper → Notify beacon. clickOld 1=none 2+=click.",
+	//cmddetail:{"name":"Beacon","args":"legacy anim bright click reps [RGB]",
+	//cmddetail:"descr":"Legacy 4-arg Beacon → plain Beacon pattern.",
 	//cmddetail:"fn":"PA_Cmd_Beacon","file":"driver/drv_pixelAnim.c","requires":"",
 	//cmddetail:"examples":"Beacon 1 200 2 3 255 100 0"}
 	CMD_RegisterCommand("Beacon", PA_Cmd_Beacon, NULL);
+	//cmddetail:{"name":"BeaconX","args":"[click][r][g][b][speed][reps]...",
+	//cmddetail:"descr":"Extended beacon (beams/width/tail). Notify only, not Ambient.",
+	//cmddetail:"fn":"PA_Cmd_BeaconX","file":"driver/drv_pixelAnim.c","requires":"",
+	//cmddetail:"examples":"BeaconX 0 255 100 0 0 3 255 0 4 1 8"}
+	CMD_RegisterCommand("BeaconX", PA_Cmd_BeaconX, NULL);
+	//cmddetail:{"name":"Solid","args":"[click][r][g][b][bright?][ramp?][clickBright?]",
+	//cmddetail:"descr":"Solid ring hold with save/restore + optional main clicks.",
+	//cmddetail:"fn":"PA_Cmd_Solid","file":"driver/drv_pixelAnim.c","requires":"",
+	//cmddetail:"examples":"Solid 0 0 255 0"}
+	CMD_RegisterCommand("Solid", PA_Cmd_Solid, NULL);
+	//cmddetail:{"name":"SolidFlash","args":"[click][r][g][b][on][off][reps]...",
+	//cmddetail:"descr":"Solid flash/pulse. on/off/rup/rdn in tenths of a second.",
+	//cmddetail:"fn":"PA_Cmd_SolidFlash","file":"driver/drv_pixelAnim.c","requires":"",
+	//cmddetail:"examples":"SolidFlash 0 0 255 0 3 3 3"}
+	CMD_RegisterCommand("SolidFlash", PA_Cmd_SolidFlash, NULL);
 	//cmddetail:{"name":"Main","args":"[ww][cw][ramp?]",
-	//cmddetail:"descr":"Set main whites ch1/2. ramp 0 instant (default), 1 ~0.5s. Clicks never ramp.",
+	//cmddetail:"descr":"Set main whites ch1/2. ramp 0 instant (default), 1 ~0.5s.",
 	//cmddetail:"fn":"PA_Cmd_Main","file":"driver/drv_pixelAnim.c","requires":"",
 	//cmddetail:"examples":"Main 100 100 1"}
 	CMD_RegisterCommand("Main", PA_Cmd_Main, NULL);
 	//cmddetail:{"name":"Halo","args":"[r][g][b][ramp?]",
-	//cmddetail:"descr":"Solid ring RGB. ramp 0 instant (default), 1 ~0.5s.",
+	//cmddetail:"descr":"Solid ring RGB without notify contract. ramp 0|1.",
 	//cmddetail:"fn":"PA_Cmd_Halo","file":"driver/drv_pixelAnim.c","requires":"",
 	//cmddetail:"examples":"Halo 255 0 0 1"}
 	CMD_RegisterCommand("Halo", PA_Cmd_Halo, NULL);
