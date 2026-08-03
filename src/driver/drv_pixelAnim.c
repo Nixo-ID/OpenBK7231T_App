@@ -377,9 +377,180 @@ static void Beacon_DrawSector(float headPos, int n, byte r, byte g, byte b, int 
 	}
 }
 
+/* ---- Main / Halo solid ramp (FW, opt-in) ----
+ * Main <ww> <cw> [ramp]   ww/cw 0-100 typical
+ * Halo <r> <g> <b> [ramp] solid ring; needs SM16703P init
+ * ramp 0=instant (default), 1=~0.5s. Clicks use WhitesHard — no ramp.
+ */
+typedef struct lightRamp_s {
+	int active;
+	int age;
+	float curA, curB, curC;	/* main: ww,cw unused; halo: r,g,b */
+	float curD;			/* main cw as curB; halo unused */
+	int tgtA, tgtB, tgtC, tgtD;
+	int isHalo;			/* 0=main 1=halo */
+} lightRamp_t;
+
+static lightRamp_t g_mainRamp;
+static lightRamp_t g_haloRamp;
+
+static void LightRamp_CancelMain(void) {
+	g_mainRamp.active = 0;
+}
+static void LightRamp_CancelHalo(void) {
+	g_haloRamp.active = 0;
+}
+
 static void Beacon_WhitesHard(int ww, int cw) {
+	/* clicks / notify hold: never ramp */
+	LightRamp_CancelMain();
 	CHANNEL_Set(BEACON_CH_WW, ww, BEACON_SET_FLAGS);
 	CHANNEL_Set(BEACON_CH_CW, cw, BEACON_SET_FLAGS);
+}
+
+static void Main_ApplyNow(int ww, int cw) {
+	LightRamp_CancelMain();
+	CHANNEL_Set(BEACON_CH_WW, ww, BEACON_SET_FLAGS);
+	CHANNEL_Set(BEACON_CH_CW, cw, BEACON_SET_FLAGS);
+}
+
+static void Halo_ApplyNow(int r, int g, int b) {
+	int i, n;
+	LightRamp_CancelHalo();
+	CHANNEL_Set(BEACON_CH_R, r, BEACON_SET_FLAGS);
+	CHANNEL_Set(BEACON_CH_G, g, BEACON_SET_FLAGS);
+	CHANNEL_Set(BEACON_CH_B, b, BEACON_SET_FLAGS);
+	n = (int)pixel_count;
+	if (n > 0) {
+		for (i = 0; i < n; i++) {
+			Strip_setPixel(i, r, g, b, 0, 0);
+		}
+		Strip_Apply();
+	}
+}
+
+static void Main_Begin(int ww, int cw, int ramp) {
+	if (ww < 0) ww = 0;
+	if (cw < 0) cw = 0;
+	if (ww > 100) ww = 100;
+	if (cw > 100) cw = 100;
+	if (!ramp) {
+		Main_ApplyNow(ww, cw);
+		return;
+	}
+	g_mainRamp.curA = (float)CHANNEL_Get(BEACON_CH_WW);
+	g_mainRamp.curB = (float)CHANNEL_Get(BEACON_CH_CW);
+	g_mainRamp.tgtA = ww;
+	g_mainRamp.tgtB = cw;
+	g_mainRamp.age = 0;
+	g_mainRamp.active = 1;
+	g_mainRamp.isHalo = 0;
+}
+
+static int ClampByteInt(int v) {
+	if (v < 0) return 0;
+	if (v > 255) return 255;
+	return v;
+}
+
+static void Halo_Begin(int r, int g, int b, int ramp) {
+	r = ClampByteInt(r);
+	g = ClampByteInt(g);
+	b = ClampByteInt(b);
+	if (!ramp) {
+		Halo_ApplyNow(r, g, b);
+		return;
+	}
+	/* start from current channel mirrors (or 0) */
+	g_haloRamp.curA = (float)CHANNEL_Get(BEACON_CH_R);
+	g_haloRamp.curB = (float)CHANNEL_Get(BEACON_CH_G);
+	g_haloRamp.curC = (float)CHANNEL_Get(BEACON_CH_B);
+	g_haloRamp.tgtA = r;
+	g_haloRamp.tgtB = g;
+	g_haloRamp.tgtC = b;
+	g_haloRamp.age = 0;
+	g_haloRamp.active = 1;
+	g_haloRamp.isHalo = 1;
+}
+
+static void LightRamp_Tick(void) {
+	float t;
+	int v0, v1, v2, i, n;
+
+	if (g_mainRamp.active) {
+		g_mainRamp.age++;
+		t = (float)g_mainRamp.age / (float)NOTIFY_RAMP_TICKS;
+		if (t >= 1.0f) {
+			t = 1.0f;
+			g_mainRamp.active = 0;
+		}
+		v0 = (int)(g_mainRamp.curA + ((float)g_mainRamp.tgtA - g_mainRamp.curA) * t + 0.5f);
+		v1 = (int)(g_mainRamp.curB + ((float)g_mainRamp.tgtB - g_mainRamp.curB) * t + 0.5f);
+		CHANNEL_Set(BEACON_CH_WW, v0, BEACON_SET_FLAGS);
+		CHANNEL_Set(BEACON_CH_CW, v1, BEACON_SET_FLAGS);
+	}
+
+	if (g_haloRamp.active) {
+		/* do not fight active Notify paint */
+		if (g_beacon.active) {
+			LightRamp_CancelHalo();
+		} else {
+			g_haloRamp.age++;
+			t = (float)g_haloRamp.age / (float)NOTIFY_RAMP_TICKS;
+			if (t >= 1.0f) {
+				t = 1.0f;
+				g_haloRamp.active = 0;
+			}
+			v0 = (int)(g_haloRamp.curA + ((float)g_haloRamp.tgtA - g_haloRamp.curA) * t + 0.5f);
+			v1 = (int)(g_haloRamp.curB + ((float)g_haloRamp.tgtB - g_haloRamp.curB) * t + 0.5f);
+			v2 = (int)(g_haloRamp.curC + ((float)g_haloRamp.tgtC - g_haloRamp.curC) * t + 0.5f);
+			CHANNEL_Set(BEACON_CH_R, v0, BEACON_SET_FLAGS);
+			CHANNEL_Set(BEACON_CH_G, v1, BEACON_SET_FLAGS);
+			CHANNEL_Set(BEACON_CH_B, v2, BEACON_SET_FLAGS);
+			n = (int)pixel_count;
+			if (n > 0) {
+				for (i = 0; i < n; i++) {
+					Strip_setPixel(i, v0, v1, v2, 0, 0);
+				}
+				Strip_Apply();
+			}
+		}
+	}
+}
+
+commandResult_t PA_Cmd_Main(const void *context, const char *cmd, const char *args, int flags) {
+	int ww, cw, ramp, narg;
+	(void)context; (void)cmd; (void)flags;
+	Tokenizer_TokenizeString(args, 0);
+	narg = Tokenizer_GetArgsCount();
+	if (narg < 2) {
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	}
+	ww = Tokenizer_GetArgInteger(0);
+	cw = Tokenizer_GetArgInteger(1);
+	ramp = (narg >= 3) ? Tokenizer_GetArgInteger(2) : 0;
+	Main_Begin(ww, cw, ramp ? 1 : 0);
+	return CMD_RES_OK;
+}
+
+commandResult_t PA_Cmd_Halo(const void *context, const char *cmd, const char *args, int flags) {
+	int r, g, b, ramp, narg;
+	(void)context; (void)cmd; (void)flags;
+	Tokenizer_TokenizeString(args, 0);
+	narg = Tokenizer_GetArgsCount();
+	if (narg < 3) {
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	}
+	r = Tokenizer_GetArgInteger(0);
+	g = Tokenizer_GetArgInteger(1);
+	b = Tokenizer_GetArgInteger(2);
+	ramp = (narg >= 4) ? Tokenizer_GetArgInteger(3) : 0;
+	if (pixel_count == 0) {
+		ADDLOG_ERROR(LOG_FEATURE_CMD, "Halo: pixel_count=0 (SM16703P Init first)");
+		return CMD_RES_ERROR;
+	}
+	Halo_Begin(r, g, b, ramp ? 1 : 0);
+	return CMD_RES_OK;
 }
 
 static int Beacon_ClickBusy(void) {
@@ -783,6 +954,16 @@ void PixelAnim_Init() {
 	//cmddetail:"fn":"PA_Cmd_Beacon","file":"driver/drv_pixelAnim.c","requires":"",
 	//cmddetail:"examples":"Beacon 1 200 2 3 255 100 0"}
 	CMD_RegisterCommand("Beacon", PA_Cmd_Beacon, NULL);
+	//cmddetail:{"name":"Main","args":"[ww][cw][ramp?]",
+	//cmddetail:"descr":"Set main whites ch1/2. ramp 0 instant (default), 1 ~0.5s. Clicks never ramp.",
+	//cmddetail:"fn":"PA_Cmd_Main","file":"driver/drv_pixelAnim.c","requires":"",
+	//cmddetail:"examples":"Main 100 100 1"}
+	CMD_RegisterCommand("Main", PA_Cmd_Main, NULL);
+	//cmddetail:{"name":"Halo","args":"[r][g][b][ramp?]",
+	//cmddetail:"descr":"Solid ring RGB. ramp 0 instant (default), 1 ~0.5s.",
+	//cmddetail:"fn":"PA_Cmd_Halo","file":"driver/drv_pixelAnim.c","requires":"",
+	//cmddetail:"examples":"Halo 255 0 0 1"}
+	CMD_RegisterCommand("Halo", PA_Cmd_Halo, NULL);
 }
 
 void PixelAnim_CreatePanel(http_request_t *request) {
@@ -832,6 +1013,9 @@ void PixelAnim_CreatePanel(http_request_t *request) {
 }
 int g_ticks = 0;
 void PixelAnim_SetAnimQuickTick() {
+	/* Main/Halo ramps run even when not in Light_Anim (solid on/off UX) */
+	LightRamp_Tick();
+
 	if (g_lightEnableAll == 0) {
 		// disabled
 		return;
