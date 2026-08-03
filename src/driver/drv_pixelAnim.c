@@ -250,11 +250,13 @@ void PixelAnim_SetAnim(int j);
 
 /* ---- Cloudcutter Beacon (on-device, HA button only) ----
  * Spec: notes/ANIMATION_DESIGN.md
- * Beacon <anim> <bright> <click> <repeats>
+ * Beacon <anim> <bright> <click> <repeats> [R G B]
  *  anim: mode (v1: 1 = dual-sector beacon)
- *  bright: 0-255 scale of base RGB
- *  click: 1=none 2=single 3=double/triple on main whites ch1/2
+ *  bright: 0-255 scale of paint RGB
+ *  click: 1=none 2=single 3=double — main whites ch1/2; first pulse at START
  *  repeats: full revolutions then self-stop + restore
+ *  R G B: optional paint color; if omitted, use saved halo (ch10-12)
+ *  SAVE always = ch1/2 + ch10-12 at Begin — paint must not overwrite that.
  */
 #ifndef BEACON_SECTOR_W
 #define BEACON_SECTOR_W		12
@@ -346,11 +348,24 @@ static void Beacon_WhitesHard(int ww, int cw) {
 	CHANNEL_Set(BEACON_CH_CW, cw, BEACON_SET_FLAGS);
 }
 
+static int Beacon_ClickBusy(void) {
+	return (g_beacon.clickMode > 1 && g_beacon.clickPhase > 0 && g_beacon.clickStep >= 0);
+}
+
+static void Beacon_HoldWhites(void) {
+	/* Main light stays at pre-anim level except during click pulse */
+	if (!Beacon_ClickBusy()) {
+		Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
+	}
+}
+
 static void Beacon_Restore(void) {
 	int n = (int)pixel_count;
 	int i;
 
 	g_beacon.active = 0;
+	g_beacon.clickPhase = 0;
+	g_beacon.clickStep = -1;
 	/* leave Light_Anim so stock tick stops calling us */
 	g_lightMode = Light_RGB;
 
@@ -431,24 +446,11 @@ void Beacon_Run(void) {
 	Beacon_DrawSector(g_beacon.pos + half, n, g_beacon.colR, g_beacon.colG, g_beacon.colB, g_beacon.bright);
 	Strip_Apply();
 
-	/* seam click: head crossing index 0 (mod n) */
-	if (g_beacon.clickMode > 1) {
-		float p0 = g_beacon.prevPos;
-		float p1 = g_beacon.pos;
-		/* unwrap */
-		while (p1 < p0) p1 += (float)n;
-		/* crossed integer multiple of n (seam) */
-		crossed = floorf(p0 / (float)n) != floorf(p1 / (float)n);
-		if (crossed && !g_beacon.seamLatched) {
-			Beacon_StartClickTrain();
-			g_beacon.seamLatched = 1;
-		}
-		/* clear latch once well past seam */
-		if (fmodf(g_beacon.pos, (float)n) > 2.0f) {
-			g_beacon.seamLatched = 0;
-		}
-	}
+	/* Pre-click is started in Begin; advance train here. No seam re-trigger
+	 * unless we later re-enable multi-click-per-rev (seamLatched). */
+	(void)crossed;
 	Beacon_ClickTick();
+	Beacon_HoldWhites();
 
 	g_beacon.prevPos = g_beacon.pos;
 	g_beacon.pos += g_beacon.speed;
@@ -464,7 +466,9 @@ void Beacon_Run(void) {
 	}
 }
 
-void Beacon_Begin(int anim, int bright, int clickMode, int repeats) {
+/* paintR/G/B: if usePaintCol, use these for ring; else paint = saved halo */
+void Beacon_Begin(int anim, int bright, int clickMode, int repeats,
+	int usePaintCol, int paintR, int paintG, int paintB) {
 	(void)anim; /* v1: single beacon mode */
 
 	if (pixel_count == 0) {
@@ -477,13 +481,19 @@ void Beacon_Begin(int anim, int bright, int clickMode, int repeats) {
 	if (clickMode > 3) clickMode = 3;
 	if (repeats < 1) repeats = 1;
 
+	/* 1) SAVE first — never paint into save slots */
 	g_beacon.saveWW = CHANNEL_Get(BEACON_CH_WW);
 	g_beacon.saveCW = CHANNEL_Get(BEACON_CH_CW);
 	g_beacon.saveR = CHANNEL_Get(BEACON_CH_R);
 	g_beacon.saveG = CHANNEL_Get(BEACON_CH_G);
 	g_beacon.saveB = CHANNEL_Get(BEACON_CH_B);
-	/* if halo channels empty, fall back to led_baseColors */
-	if (g_beacon.saveR == 0 && g_beacon.saveG == 0 && g_beacon.saveB == 0) {
+
+	/* 2) paint color separate from save */
+	if (usePaintCol) {
+		g_beacon.colR = (byte)(paintR < 0 ? 0 : (paintR > 255 ? 255 : paintR));
+		g_beacon.colG = (byte)(paintG < 0 ? 0 : (paintG > 255 ? 255 : paintG));
+		g_beacon.colB = (byte)(paintB < 0 ? 0 : (paintB > 255 ? 255 : paintB));
+	} else if (g_beacon.saveR == 0 && g_beacon.saveG == 0 && g_beacon.saveB == 0) {
 		g_beacon.colR = (byte)led_baseColors[0];
 		g_beacon.colG = (byte)led_baseColors[1];
 		g_beacon.colB = (byte)led_baseColors[2];
@@ -503,34 +513,59 @@ void Beacon_Begin(int anim, int bright, int clickMode, int repeats) {
 	g_beacon.speed = BEACON_SPEED_LED;
 	g_beacon.clickPhase = 0;
 	g_beacon.clickStep = -1;
-	g_beacon.seamLatched = 0;
+	g_beacon.seamLatched = 1; /* no seam auto-click in v1; only start pulse */
 	g_beacon.active = 1;
 
-	/* own cadence: every quick-tick */
+	/* own cadence: every quick-tick; avoid apply_smart_light (kills ScriptOnly whites) */
 	g_speed = 0;
 	if (g_beaconAnimIndex >= 0) {
-		PixelAnim_SetAnim(g_beaconAnimIndex);
+		activeAnim = g_beaconAnimIndex;
+		g_lightMode = Light_Anim;
+		LED_SetEnableAll(true);
+		/* do not call apply_smart_light() — zeros ScriptOnly PWM whites */
+		MQTT_PublishMain_StringString_DeDuped(DEDUP_CURRENT_ANIM, DEDUP_EXPIRE_TIME,
+			"currentAnim", "Beacon", 0);
+	} else {
+		LED_SetEnableAll(true);
 	}
-	LED_SetEnableAll(true);
+
+	/* main light stays at saved level */
+	Beacon_WhitesHard(g_beacon.saveWW, g_beacon.saveCW);
+
+	/* click BEFORE / at start of animation */
+	if (clickMode > 1) {
+		Beacon_StartClickTrain();
+	}
 
 	ADDLOG_INFO(LOG_FEATURE_CMD,
-		"Beacon: start bright=%i click=%i ticks=%i reps=%i n=%i RGB=%i,%i,%i savedWW/CW=%i/%i",
+		"Beacon: start bright=%i click=%i ticks=%i reps=%i n=%i paintRGB=%i,%i,%i savedWW/CW=%i/%i savedRGB=%i,%i,%i",
 		bright, clickMode, g_beacon.clickTicks, repeats, (int)pixel_count,
-		g_beacon.colR, g_beacon.colG, g_beacon.colB, g_beacon.saveWW, g_beacon.saveCW);
+		g_beacon.colR, g_beacon.colG, g_beacon.colB,
+		g_beacon.saveWW, g_beacon.saveCW,
+		g_beacon.saveR, g_beacon.saveG, g_beacon.saveB);
 }
 
 commandResult_t PA_Cmd_Beacon(const void *context, const char *cmd, const char *args, int flags) {
 	int anim, bright, clickMode, repeats;
+	int usePaint = 0, pr = 0, pg = 0, pb = 0;
+	int narg;
 
 	Tokenizer_TokenizeString(args, 0);
-	if (Tokenizer_GetArgsCount() < 4) {
+	narg = Tokenizer_GetArgsCount();
+	if (narg < 4) {
 		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
 	}
 	anim = Tokenizer_GetArgInteger(0);
 	bright = Tokenizer_GetArgInteger(1);
 	clickMode = Tokenizer_GetArgInteger(2);
 	repeats = Tokenizer_GetArgInteger(3);
-	Beacon_Begin(anim, bright, clickMode, repeats);
+	if (narg >= 7) {
+		usePaint = 1;
+		pr = Tokenizer_GetArgInteger(4);
+		pg = Tokenizer_GetArgInteger(5);
+		pb = Tokenizer_GetArgInteger(6);
+	}
+	Beacon_Begin(anim, bright, clickMode, repeats, usePaint, pr, pg, pb);
 	return CMD_RES_OK;
 }
 
