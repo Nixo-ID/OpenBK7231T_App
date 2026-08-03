@@ -258,7 +258,7 @@ void PixelAnim_SetAnim(int j);
  *   speed:   0=default ~2 LED/tick, 1..10 scale
  *   reps:    revolutions (>=1) for Notify; ignored for Ambient
  *   bright:  optional 0-255 scale, default 255
- *   ramp:    0=instant paint, 1=~0.5s fade-in (default 1). Clicks never ramp.
+ *   ramp:    0=instant paint (default), 1=~0.5s fade-in. Clicks never ramp.
  *
  * Ambient <pattern> <r> <g> <b> <speed> [bright] [ramp]
  * Ambient stop | RingStop  → restore saved main+halo
@@ -625,7 +625,7 @@ commandResult_t PA_Cmd_Notify(const void *context, const char *cmd, const char *
 	speed = Tokenizer_GetArgInteger(5);
 	reps = Tokenizer_GetArgInteger(6);
 	bright = (narg >= 8) ? Tokenizer_GetArgInteger(7) : 255;
-	ramp = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 1; /* default ON */
+	ramp = (narg >= 9) ? Tokenizer_GetArgInteger(8) : 0; /* default OFF; pass 1 to enable */
 	Notify_Begin(pat, click, r, g, b, speed, reps, bright, 0, ramp);
 	return CMD_RES_OK;
 }
@@ -655,7 +655,7 @@ commandResult_t PA_Cmd_Ambient(const void *context, const char *cmd, const char 
 	b = Tokenizer_GetArgInteger(3);
 	speed = Tokenizer_GetArgInteger(4);
 	bright = (narg >= 6) ? Tokenizer_GetArgInteger(5) : 255;
-	ramp = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 1;
+	ramp = (narg >= 7) ? Tokenizer_GetArgInteger(6) : 0; /* default OFF */
 	Notify_Begin(pat, 0, r, g, b, speed, 0, bright, 1, ramp);
 	return CMD_RES_OK;
 }
@@ -689,7 +689,7 @@ commandResult_t PA_Cmd_Beacon(const void *context, const char *cmd, const char *
 		pb = Tokenizer_GetArgInteger(6);
 	}
 	click = (clickOld >= 2) ? 1 : 0;
-	Notify_Begin(NOTIFY_PAT_BEACON, click, pr, pg, pb, 0, repeats, bright, 0, 1);
+	Notify_Begin(NOTIFY_PAT_BEACON, click, pr, pg, pb, 0, repeats, bright, 0, 0);
 	return CMD_RES_OK;
 }
 
@@ -764,12 +764,12 @@ void PixelAnim_Init() {
 	//cmddetail:"examples":""}
 	CMD_RegisterCommand("AnimSpeed", PA_Cmd_AnimSpeed, NULL);
 	//cmddetail:{"name":"Notify","args":"[pattern][click][r][g][b][speed][reps][bright?][ramp?]",
-	//cmddetail:"descr":"Finite ring notify; ramp 0|1 default 1 (~0.5s). click 0|1. Clicks no ramp.",
+	//cmddetail:"descr":"Finite ring notify; ramp 0|1 default 0 (off). click 0|1. Clicks no ramp.",
 	//cmddetail:"fn":"PA_Cmd_Notify","file":"driver/drv_pixelAnim.c","requires":"",
-	//cmddetail:"examples":"Notify beacon 1 255 100 0 0 3"}
+	//cmddetail:"examples":"Notify beacon 1 255 100 0 0 3 255 1"}
 	CMD_RegisterCommand("Notify", PA_Cmd_Notify, NULL);
 	//cmddetail:{"name":"Ambient","args":"[pattern][r][g][b][speed][bright?][ramp?]|stop",
-	//cmddetail:"descr":"Background ring loop until Ambient stop / RingStop. ramp default 1.",
+	//cmddetail:"descr":"Background ring loop until Ambient stop / RingStop. ramp default 0.",
 	//cmddetail:"fn":"PA_Cmd_Ambient","file":"driver/drv_pixelAnim.c","requires":"",
 	//cmddetail:"examples":"Ambient beacon 255 100 0 0"}
 	CMD_RegisterCommand("Ambient", PA_Cmd_Ambient, NULL);
