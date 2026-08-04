@@ -158,3 +158,16 @@ https://www.elektroda.com/rtvforum/topic3806769.html
 ❤️ Love the project? Please consider supporting it with a donation: https://www.paypal.com/paypalme/openshwprojects ❤️
 
 Special thanks to all open-source contributors whose work has served as a valuable reference and inspiration for the development of this project.
+
+## Also: BK7231N / CBU (Lumary 6 inch US-SD6E + future 8 inch CBU)
+
+Same branch builds **OpenBK7231N** (GitHub Actions matrix / local `build_scripts/build_bk7231n.bat`).
+
+Includes ring notify stack: Main/Halo/Solid/Notify/Ambient/RingStop (platform-agnostic).
+
+**Not** applied on N: BK7238 SPI DMA patch, RF partition `0x1E3000` (T1 only).
+
+Local N build:
+```
+build_scripts\build_bk7231n.bat patch_ring-notify_<sha12>
+```
