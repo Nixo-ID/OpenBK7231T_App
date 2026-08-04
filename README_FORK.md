@@ -21,7 +21,7 @@ The working branch **`patch/bk7238-spidma-timeout`** is maintained for **one fix
 | P24 | PWM_ScriptOnly ch2 | Cold white |
 | P16 | SM16703P_DIN | RGB ring data, **62** LEDs, RGB order |
 
-Main features on the lab branch: SPI DMA multi-`SM16703P_Start` fix, on-device Notify/Ambient ring animations, Main/Halo commands, strip clear on restore.
+Main features on the lab branch: SPI DMA multi-`SM16703P_Start` fix, on-device Notify/Ambient ring animations, Main/Halo commands, strip clear on restore, **BK7238 RF partition at stock Tuya `0x1E3000`** (factory MAC+cal; avoids shared fallback MAC `c8:47:8c:42:88:48`).
 
 Lab notes, commissioning scripts, and HA drafts live in the private project repo **Cloudcutter-Lumary8** (not in this tree).
 

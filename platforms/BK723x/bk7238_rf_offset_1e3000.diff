@@ -1,0 +1,15 @@
+diff --git a/beken378/func/user_driver/BkDriverFlash.c b/beken378/func/user_driver/BkDriverFlash.c
+index 6b81954..5379164 100644
+--- a/beken378/func/user_driver/BkDriverFlash.c
++++ b/beken378/func/user_driver/BkDriverFlash.c
+@@ -125,6 +125,10 @@ const bk_logic_partition_t bk7231_partitions_2M[BK_PARTITION_MAX] =
+         .partition_start_addr      = 0x1e0000,// bootloader unused space for rf cal+mac related info.
+ #elif (CFG_SOC_NAME == SOC_BK7231N)
+         .partition_start_addr      = 0x1d0000,
++#elif (CFG_SOC_NAME == SOC_BK7238)
++        /* Tuya T1-U / stock BK7238: factory RF TLV (MAC+cal) is at 0x1e3000.
++         * Default OpenBeken 0x1e0000 is blank on these modules -> shared fallback MAC. */
++        .partition_start_addr      = 0x1e3000,
+ #else
+         .partition_start_addr      = 0x1e0000,// for rf related info
+ #endif
