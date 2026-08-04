@@ -303,6 +303,7 @@ jobs:
 
   build_txw81x:
     name: Build TXW81X
+    if: false
     needs: refs
     runs-on: windows-latest
     defaults:
@@ -337,7 +338,8 @@ jobs:
   merge:
     name: Merge Artifacts
     runs-on: ubuntu-22.04
-    needs: [refs, build, build2, build_idf, build_txw81x]
+    # Fleet: only Beken Build + simulator; IDF/TXW disabled above
+    needs: [refs, build, build2]
     #if: always() && needs.refs.outputs.new_release == 'true' && (github.ref == 'refs/heads/main' || github.ref_name == 'alpha')
     steps:
       - name: Merge Artifacts
