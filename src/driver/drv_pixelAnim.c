@@ -255,7 +255,7 @@ void PixelAnim_SetAnim(int j);
  *
  * Notify Beacon <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [clickBright]
  * Notify BeaconX <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [beams] [width] [tail] [clickBright]
- * speed: 1..9 = legacy (LED/tick = arg*0.4); >=10 = tenths LED/tick (5=0.5, 12=1.2≈old 3)
+ * speed: tenths of LED/tick (5=0.5, 10=1.0 max for 6", 12=1.2 ≈ old 8" arg 3)
  * Solid <click> <r> <g> <b> [bright] [ramp] [clickBright]
  * SolidFlash <click> <r> <g> <b> <on> <off> <reps> [bright] [rup] [rdn] [clickBright]
  *   on/off/rup/rdn in tenths of second (3 = 0.3s)
@@ -665,15 +665,10 @@ static float Notify_SpeedFromArg(int speedArg) {
 	if (speedArg <= 0) {
 		return BEACON_SPEED_LED;
 	}
-	/* speedArg >= 10: tenths of LED/tick (5 = 0.5, 12 = 1.2 ≈ legacy "3").
-	 * speedArg 1..9: legacy LED/tick = arg * 0.4 (3 = 1.2) — keep old HA payloads.
+	/* Always tenths of LED per tick: 5 = 0.5, 10 = 1.0 (6" max eye), 12 = 1.2 (old 8" "3").
+	 * Breaking: old 1..9 *0.4 — HA must use tenths (8" SPEED 3 → 12).
 	 */
-	if (speedArg >= 10) {
-		s = (float)speedArg * 0.1f;
-	} else {
-		s = (float)speedArg * 0.4f;
-	}
-	/* allow slow smooth motion on small rings (was min 0.25) */
+	s = (float)speedArg * 0.1f;
 	if (s < 0.05f) s = 0.05f;
 	if (s > 8.0f) s = 8.0f;
 	return s;
