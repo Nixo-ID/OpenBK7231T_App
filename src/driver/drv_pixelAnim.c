@@ -255,6 +255,7 @@ void PixelAnim_SetAnim(int j);
  *
  * Notify Beacon <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [clickBright]
  * Notify BeaconX <click> <r> <g> <b> <speed> <reps> [bright] [ramp] [beams] [width] [tail] [clickBright]
+ * speed: 1..9 = legacy (LED/tick = arg*0.4); >=10 = tenths LED/tick (5=0.5, 12=1.2≈old 3)
  * Solid <click> <r> <g> <b> [bright] [ramp] [clickBright]
  * SolidFlash <click> <r> <g> <b> <on> <off> <reps> [bright] [rup] [rdn] [clickBright]
  *   on/off/rup/rdn in tenths of second (3 = 0.3s)
@@ -664,8 +665,16 @@ static float Notify_SpeedFromArg(int speedArg) {
 	if (speedArg <= 0) {
 		return BEACON_SPEED_LED;
 	}
-	s = (float)speedArg * 0.4f;
-	if (s < 0.25f) s = 0.25f;
+	/* speedArg >= 10: tenths of LED/tick (5 = 0.5, 12 = 1.2 ≈ legacy "3").
+	 * speedArg 1..9: legacy LED/tick = arg * 0.4 (3 = 1.2) — keep old HA payloads.
+	 */
+	if (speedArg >= 10) {
+		s = (float)speedArg * 0.1f;
+	} else {
+		s = (float)speedArg * 0.4f;
+	}
+	/* allow slow smooth motion on small rings (was min 0.25) */
+	if (s < 0.05f) s = 0.05f;
 	if (s > 8.0f) s = 8.0f;
 	return s;
 }
@@ -715,19 +724,32 @@ static void Beacon_DrawBeams(float pos, int n, int beams, int tail, int bright,
 		float head = pos + ((float)bi * (float)n / (float)beams);
 		while (head >= (float)n) head -= (float)n;
 		while (head < 0) head += (float)n;
-		/* reuse sector drawer: uses BEACON_TAIL constant internally — use local loop */
+		/* Soft sub-pixel head + quadratic tail falloff (less strobe on small rings). */
 		{
 			int base = (int)floorf(head);
 			float frac = head - (float)base;
 			int t;
 			int tMax = tail;
-			Beacon_AddPixel(base, n, r, g, b, 1.0f - frac, bright);
-			Beacon_AddPixel(base + 1, n, r, g, b, frac, bright);
+			float w0, w1, w2, w3;
+			/* 4-LED soft head (was hard 2-LED) — brightness steps less obvious */
+			w0 = (1.0f - frac) * 0.20f;
+			w1 = (1.0f - frac) * 0.80f + frac * 0.20f;
+			w2 = frac * 0.80f + (1.0f - frac) * 0.20f;
+			w3 = frac * 0.20f;
+			Beacon_AddPixel(base - 1, n, r, g, b, w0, bright);
+			Beacon_AddPixel(base, n, r, g, b, w1, bright);
+			Beacon_AddPixel(base + 1, n, r, g, b, w2, bright);
+			Beacon_AddPixel(base + 2, n, r, g, b, w3, bright);
 			for (t = 1; t <= tMax; t++) {
-				float scale = (float)(tMax - t) / (float)(tMax > 0 ? tMax : 1);
+				float u = (float)t / (float)(tMax + 1);
+				/* ease: near-head bright, smooth fade (quadratic) */
+				float scale = (1.0f - u) * (1.0f - u);
+				float behind = (float)base - (float)t + (1.0f - frac);
+				int bi0 = (int)floorf(behind);
+				float f2 = behind - (float)bi0;
 				if (scale < 0) scale = 0;
-				Beacon_AddPixel(base - t, n, r, g, b, scale * (1.0f - frac), bright);
-				Beacon_AddPixel(base - t + 1, n, r, g, b, scale * frac, bright);
+				Beacon_AddPixel(bi0, n, r, g, b, scale * (1.0f - f2), bright);
+				Beacon_AddPixel(bi0 + 1, n, r, g, b, scale * f2, bright);
 			}
 		}
 	}
