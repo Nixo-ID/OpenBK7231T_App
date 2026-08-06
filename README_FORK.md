@@ -23,6 +23,6 @@ The working branch **`patch/bk7238-spidma-timeout`** is maintained for **one fix
 
 Main features on the lab branch: SPI DMA multi-`SM16703P_Start` fix, on-device Notify/Ambient ring animations, Main/Halo commands, strip clear on restore, **BK7238 RF partition at stock Tuya `0x1E3000`** (factory MAC+cal; avoids shared fallback MAC `c8:47:8c:42:88:48`).
 
-Lab notes, commissioning scripts, and HA drafts live in the project repo **[Cloudcutter-Lumary8](https://github.com/Nixo-ID/Cloudcutter-Lumary8)** (not in this tree).
+Lab notes, commissioning scripts, and HA drafts live in the project repo **[Cloudcutter.Lumary8](https://github.com/Nixo-ID/Cloudcutter.Lumary8)** (not in this tree).
 
 Upstream README below / in `README.md` still describes multi-platform OpenBeken; **do not treat this fork as tested on other devices.**
